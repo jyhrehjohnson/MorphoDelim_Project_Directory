@@ -1,0 +1,14 @@
+# Exclude data files — if they are too large for Git
+# Edit this list and necessary. You can include smaller data files if you like.
+*.csv
+*.tsv
+*.xlsx
+data/raw/
+data/processed/
+
+# Exclude OS files
+.DS_Store
+*~
+
+# Exclude virtual environment
+.venv/
