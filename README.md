@@ -7,6 +7,7 @@ under controlled, evaluated with the Adjusted Rand Index (ARI). It is Chapter 2 
 
 ## Project context
 Project: Chapter 2 MorphoDelim
+
 Institution: The University of Texas at Austin
 
 ## Repository structure
