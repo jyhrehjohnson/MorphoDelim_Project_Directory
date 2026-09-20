@@ -23,7 +23,8 @@ R packages:
 Not really sure what to put here. 
 
 ## Data
-The data was compiled from published hominin character matrices. 
+The data was compiled from published hominin character matrices from Strait et al. 1997; 2004, Dembo et al. 2015, and Mongle et al. 2019
+
 
 ## Author
 Name: Jyhreh Johnson 
