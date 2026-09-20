@@ -1,0 +1,2196 @@
+---
+title: "MorphoDelim: A Simulation-Based Framework for Species Delimitation in the Hominin Fossil Record"
+author: "Jyhreh Johnson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+# -----------------------------------------------------------------------------
+# SETUP
+# -----------------------------------------------------------------------------
+# This block runs silently (include = FALSE) and configures global knitting
+# options for the entire document.
+#
+#   echo    = TRUE  — all code chunks are printed in the output, allowing
+#                     committee members and reviewers to read every line
+#                     of analysis alongside the results.
+#   message = FALSE — suppresses package-loading messages (e.g. phytools
+#                     startup text) so they do not clutter the output.
+#   warning = FALSE — suppresses non-fatal warnings that do not affect
+#                     results (e.g. ggplot2 scale notices). Genuine errors
+#                     will still halt execution and be reported.
+# -----------------------------------------------------------------------------
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+---
+
+# Overview
+
+This document contains the complete, reproducible code for **MorphoDelim**, the
+simulation-based species delimitation framework proposed in Chapter 2 of the
+dissertation *Defining Species: Taxonomy and Species Delimitation Among
+Plio-Pleistocene Hominins* (Johnson, in preparation).
+
+MorphoDelim has three phases:
+
+- **Phase 1 — Build:** Construct a three-taxon phylogeny and simulate trait
+  evolution along its branches using established evolutionary models.
+- **Phase 2 — Sample:** Draw individual specimens from each taxon, grounding
+  within-species variance in published extant ape data.
+- **Phase 3 — Blind Analysis:** Strip true species labels, apply Gower distance
+  + PAM clustering under two delimitation protocols (Sequential and
+  Simultaneous), and evaluate recovery using ARI, confusion matrices, and Kappa.
+
+Following the single-pass demonstration, a systematic 13-experiment framework
+(Table 3 of the dissertation) is run with 100 replicates per condition. The
+document concludes with stubs for the **Aim 3 fossil application**, which will
+be completed once fossil character data and MLP-3000 measurements are obtained.
+
+---
+
+# Packages and Reproducibility
+
+```{r packages-and-seed}
+# -----------------------------------------------------------------------------
+# PACKAGE LOADING
+# -----------------------------------------------------------------------------
+# All packages used in this analysis are loaded here so that a reviewer can
+# see the complete dependency list in one place.
+#
+#   phytools  — fastBM() for Brownian Motion trait simulation
+#   ape       — read.tree() to parse Newick phylogeny strings; sim.Mk()
+#               for discrete-trait Markov simulation
+#   cluster   — daisy() for Gower distance; pam() for PAM clustering;
+#               adjustedRandIndex() for ARI evaluation
+#   mclust    — Mclust() and mclustBIC() for Gaussian Mixture Model
+#   factoextra — fviz_dend() for dendrogram visualisation
+#   ggplot2   — all data visualisations
+#   patchwork — combining multiple ggplot panels into one figure
+#   caret     — confusionMatrix() for per-species accuracy metrics
+#   randomForest — supervised Random Forest classifier (benchmark only)
+#   e1071     — SVM classifier (benchmark only)
+#   igraph    — graph construction and max_cliques() for Clique Analysis
+#   knitr     — kable() for formatted tables in the HTML output
+# -----------------------------------------------------------------------------
+library(phytools)
+library(ape)
+library(cluster)
+library(mclust)
+library(factoextra)
+library(ggplot2)
+library(patchwork)
+library(caret)
+library(randomForest)
+library(e1071)
+library(igraph)
+library(knitr)
+
+# -----------------------------------------------------------------------------
+# GLOBAL RANDOM SEED
+# -----------------------------------------------------------------------------
+# A single seed is set here, before any stochastic function is called, so
+# that every result in this document — phylogenetic trait simulation, specimen
+# sampling, and classifier training — is exactly reproducible across runs.
+#
+# To verify reproducibility: knit the document twice and compare the numeric
+# output. All ARI values, cluster contingency tables, and figures should be
+# identical.
+#
+# To explore sensitivity to the seed: change the value below and re-knit.
+# Results should be qualitatively similar across seeds if the method is robust.
+# -----------------------------------------------------------------------------
+GLOBAL_SEED <- 37
+set.seed(GLOBAL_SEED)
+cat("Global seed set to:", GLOBAL_SEED, "\n")
+cat("R version:", R.version$version.string, "\n")
+cat("Analysis date:", format(Sys.Date(), "%B %d, %Y"), "\n")
+```
+
+---
+
+# Utility Functions
+
+```{r utility-functions}
+# -----------------------------------------------------------------------------
+# UTILITY FUNCTIONS
+# -----------------------------------------------------------------------------
+# These helper functions are used by multiple later chunks. Defining them
+# here — before any analysis chunk — prevents the duplicate-definition problem
+# and makes their logic easy for reviewers to locate.
+# -----------------------------------------------------------------------------
+
+# align_labels()
+# --------------
+# After PAM clustering, cluster IDs (1, 2, 3) are arbitrary integers that do
+# not correspond to taxon names. This function maps each cluster ID to the true
+# species label that is most common within it (majority vote), producing
+# human-readable labels for the confusion matrix and accuracy statistics.
+#
+# Arguments:
+#   clusters    — integer vector of cluster assignments (length = n specimens)
+#   true_labels — character vector of true species labels (same length)
+#
+# Returns:
+#   character vector of majority-vote species labels, one per specimen
+
+align_labels <- function(clusters, true_labels) {
+  k         <- length(unique(clusters))
+  label_map <- sapply(seq_len(k), function(c) {
+    tab <- table(true_labels[clusters == c])
+    names(which.max(tab))
+  })
+  label_map[clusters]
+}
+
+
+# compute_empirical_fst()
+# -----------------------
+# The dissertation uses FST (Wright 1949, 1950) as a proxy for the ratio of
+# between-species variation to total variation. FST = 1 indicates completely
+# non-overlapping groups; FST = 0 indicates groups are indistinguishable.
+#
+# This function computes a simple, univariate FST analogue from a numeric
+# trait vector and a group-membership vector, following the standard ANOVA
+# decomposition: FST ≈ (MS_between - MS_within) / MS_between.
+#
+# For the simulation, we report the mean FST across the two continuous traits
+# so that nominal parameter choices (sig2, within_sd) can be verified against
+# their intended FST level.
+#
+# Arguments:
+#   trait  — numeric vector of trait values across all specimens
+#   groups — character or factor vector of group labels (same length)
+#
+# Returns:
+#   scalar FST estimate (clamped to [0, 1])
+
+compute_empirical_fst <- function(trait, groups) {
+  groups  <- as.factor(groups)
+  k       <- nlevels(groups)
+  n_total <- length(trait)
+  grand_mean <- mean(trait, na.rm = TRUE)
+
+  # Between-group sum of squares
+  ss_between <- sum(sapply(levels(groups), function(g) {
+    g_vals <- trait[groups == g]
+    ng     <- sum(!is.na(g_vals))
+    ng * (mean(g_vals, na.rm = TRUE) - grand_mean)^2
+  }))
+
+  # Total sum of squares
+  ss_total <- sum((trait - grand_mean)^2, na.rm = TRUE)
+
+  fst <- ifelse(ss_total == 0, 0, ss_between / ss_total)
+  max(0, min(1, fst))   # clamp to [0, 1]
+}
+
+
+# introduce_missing()
+# -------------------
+# Applies Missing Completely At Random (MCAR) missingness to specified columns
+# of a data frame. Each cell is independently set to NA with probability p_miss.
+# MCAR is the simplest missing-data model; it assumes the probability of a value
+# being missing does not depend on the value itself or on other variables.
+#
+# Arguments:
+#   df     — data frame containing trait columns
+#   cols   — character vector of column names to corrupt
+#   p_miss — scalar probability of any given value being set to NA
+#   seed   — integer seed for reproducibility within this call
+#
+# Returns:
+#   data frame with NAs introduced in the specified columns
+
+introduce_missing <- function(df, cols, p_miss, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  df_missing <- df
+  for (col in cols) {
+    n_miss   <- rbinom(1, size = nrow(df), prob = p_miss)
+    miss_idx <- sample(nrow(df), n_miss, replace = FALSE)
+    df_missing[miss_idx, col] <- NA
+  }
+  df_missing
+}
+
+
+# impute_median_mode()
+# --------------------
+# Applies simple median imputation for continuous columns and mode imputation
+# for binary discrete columns. Used in the missing-data experiment as a
+# baseline imputation strategy before clustering.
+#
+# Median imputation is conservative — it does not add information beyond
+# the central tendency of each trait — which makes it a reasonable lower
+# bound on imputation performance.
+#
+# Arguments:
+#   df        — data frame with possible NAs
+#   cont_cols — character vector of continuous column names
+#   disc_cols — character vector of binary discrete column names
+#
+# Returns:
+#   data frame with NAs replaced by median (continuous) or mode (discrete)
+
+impute_median_mode <- function(df, cont_cols, disc_cols) {
+  df_imp <- df
+  for (col in cont_cols) {
+    med <- median(df[[col]], na.rm = TRUE)
+    df_imp[[col]][is.na(df_imp[[col]])] <- med
+  }
+  for (col in disc_cols) {
+    mode_val <- as.numeric(
+      names(sort(table(df[[col]]), decreasing = TRUE)[1])
+    )
+    df_imp[[col]][is.na(df_imp[[col]])] <- mode_val
+  }
+  df_imp
+}
+
+
+# build_gower_matrix()
+# --------------------
+# Computes a Gower dissimilarity matrix from a feature data frame containing
+# a mix of continuous and factor (discrete) columns, then replaces any NA
+# distances (which occur when two specimens share NAs on all traits) with the
+# maximum observed distance. This worst-case substitution ensures PAM can
+# always run without crashing on incomplete data.
+#
+# Arguments:
+#   feat_df — data frame with continuous numeric columns and factor columns
+#             for discrete traits
+#
+# Returns:
+#   a 'dist' object (lower-triangular dissimilarity matrix) with no NAs
+
+build_gower_matrix <- function(feat_df) {
+  gd     <- daisy(feat_df, metric = "gower")
+  gd_mat <- as.matrix(gd)
+  max_d  <- max(gd_mat, na.rm = TRUE)
+  gd_mat[is.na(gd_mat)] <- max_d
+  as.dist(gd_mat)
+}
+
+
+cat("Utility functions loaded: align_labels, compute_empirical_fst,\n")
+cat("  introduce_missing, impute_median_mode, build_gower_matrix\n")
+```
+
+---
+
+# Grounding the Simulation in Extant Ape Data
+
+```{r grounding-table}
+# -----------------------------------------------------------------------------
+# GROUNDING THE SIMULATION IN PUBLISHED PRIMATE DATA
+# -----------------------------------------------------------------------------
+# The within-species standard deviations used throughout the simulation are not
+# arbitrary — they are anchored to published coefficients of variation (CVs)
+# from three extant African ape taxa that bracket the plausible range of
+# intraspecific variation in Plio-Pleistocene hominin assemblages
+# (Ackermann, 2002; Plavcan & Cope, 2001).
+#
+# Three reference species define three variance bounds:
+#
+#   Pan paniscus (bonobo)           — LOW bound
+#     Low sexual dimorphism, geographically restricted population.
+#     Represents a morphologically homogeneous fossil assemblage.
+#
+#   Pan troglodytes (chimpanzee)    — MODERATE bound
+#     Moderate dimorphism, best single-value estimate for a mixed-sex
+#     Australopithecus fossil sample.
+#
+#   Gorilla gorilla (western gorilla) — HIGH bound
+#     Pronounced sexual dimorphism and geographic subdivision. Represents
+#     a highly variable assemblage, analogous to Paranthropus.
+#
+# CV is reported as a percentage (CV = SD / mean × 100). Because CV is
+# scale-independent, it allows direct comparison across measurements of
+# different absolute sizes.
+#
+# IMPORTANT — DATA ENTRY INSTRUCTIONS:
+# The CV_pct values below are marked [APPROX] where they are approximate
+# estimates used during the prospectus stage. Before the final dissertation
+# analysis, each value must be replaced with the exact figure from the
+# descriptive statistics table of the cited paper.
+#
+# To update a value:
+#   1. Locate the cited paper (reference column).
+#   2. Find the descriptive statistics table for the relevant taxon,
+#      measurement, and sex grouping.
+#   3. Compute CV = (SD / mean) × 100 if not reported directly.
+#   4. Enter the exact CV and the sample size (n) into this table.
+#   5. The SD_mm column and all within_sd values derived below will
+#      update automatically.
+# -----------------------------------------------------------------------------
+
+ground <- data.frame(
+  Bound         = c("Low",  "Low",
+                    "Med",  "Med",
+                    "High", "High"),
+  Species       = c("Pan paniscus",    "Pan paniscus",
+                    "Pan troglodytes", "Pan troglodytes",
+                    "Gorilla gorilla", "Gorilla gorilla"),
+  Trait         = c("Cranial breadth", "M1 MD length",
+                    "Cranial breadth", "M1 MD length",
+                    "Cranial breadth", "M1 MD length"),
+  Sex           = c("Pooled", "Pooled",
+                    "Pooled", "Pooled",
+                    "Pooled", "Pooled"),
+  # [FILL] Replace NA with the sample size from the cited paper
+  n             = c(NA_integer_, NA_integer_,
+                    NA_integer_, NA_integer_,
+                    NA_integer_, NA_integer_),
+  # [APPROX] Replace with exact CV values from cited papers
+  CV_pct        = c(4.5,  5.0,
+                    6.0,  5.5,
+                    9.0,  8.0),
+  Trait_mean_mm = c(130, 14,
+                    130, 14,
+                    130, 14),
+  Source        = c("Ackermann (2002)",
+                    "Pilbrow (2006)",
+                    "Ackermann (2002)",
+                    "Pilbrow (2006)",
+                    "Albrecht et al. (2003); Leigh et al. (2003)",
+                    "Uchida (1998)"),
+  stringsAsFactors = FALSE
+)
+
+# Derive SD from CV: SD = (CV / 100) × trait_mean
+# This is the key conversion — once exact CVs are entered above, the
+# SD_mm column and all downstream within_sd values update automatically.
+ground$SD_mm <- round((ground$CV_pct / 100) * ground$Trait_mean_mm, 2)
+
+kable(
+  ground[, c("Bound", "Species", "Trait", "Sex", "n",
+             "CV_pct", "SD_mm", "Source")],
+  col.names = c("Bound", "Species", "Trait", "Sex", "n",
+                "CV (%)", "SD (mm)", "Source"),
+  caption   = paste("Table 2. Empirical CV values from extant African apes",
+                    "used to ground simulation within-species variance bounds.",
+                    "CV (%) values marked [APPROX] must be replaced with exact",
+                    "figures from the cited papers before final analysis."),
+  align     = "llllrrrl"
+)
+```
+
+---
+
+# Phase 1: Build — Phylogeny and Trait Evolution
+
+## Phylogeny
+
+```{r phase1-phylogeny}
+# -----------------------------------------------------------------------------
+# PHASE 1: BUILD — SIMULATED PHYLOGENY
+# -----------------------------------------------------------------------------
+# The simulation begins with a three-taxon rooted phylogeny in Newick format.
+# This topology mirrors the structure used in the prospectus (Figure 3) and
+# represents the simplest phylogeny that can test the anchoring-bias hypothesis:
+# one outgroup (Taxon 1) and two sister taxa (Taxon 2, Taxon 3).
+#
+# Newick string: (Taxon_1:2.0,(Taxon_2:1.0,Taxon_3:1.0):1.0);
+#
+#   Taxon_1 (outgroup) — branch length 2.0 Ma
+#     Maps to: P. robustus (or the most morphologically distinct taxon)
+#     The long branch produces the largest gap in morphospace, making
+#     Taxon 1 the easiest to isolate in Step 1 of Sequential delimitation.
+#
+#   Taxon_2 (sister) — branch length 1.0 Ma from the internal node
+#     Maps to: A. afarensis
+#
+#   Taxon_3 (sister) — branch length 1.0 Ma from the internal node
+#     Maps to: A. africanus
+#
+#   Internal branch — length 1.0 Ma
+#     Shared ancestry between Taxon 2 and Taxon 3. The shorter this branch
+#     relative to within-species variance, the harder the sister pair is to
+#     separate — this is the primary stress test in the simulation.
+#
+# read.tree() parses the Newick string into an ape 'phylo' object.
+# -----------------------------------------------------------------------------
+
+hominin_tree <- read.tree(
+  text = "(Taxon_1:2.0,(Taxon_2:1.0,Taxon_3:1.0):1.0);"
+)
+hominin_tree$node.labels <- c("Root", "Clade")
+
+cat("Simulated phylogeny structure:\n")
+print(hominin_tree)
+
+# Plot the phylogeny with time axis
+par(mfrow = c(1, 1), mar = c(2, 2, 3, 2))
+plot(hominin_tree,
+     main         = "Simulated Hominin Phylogeny (Figure 3)",
+     edge.width   = 3,
+     label.offset = 0.05,
+     cex          = 1.4,
+     tip.col      = c("#DF414D", "#86D43A", "#51BBE7"))
+add.scale.bar()
+nodelabels(hominin_tree$node.labels,
+           cex   = 0.8,
+           frame = "rect",
+           bg    = "lightyellow")
+axisPhylo()
+```
+
+## Continuous Trait Evolution (Brownian Motion)
+
+```{r phase1-continuous-traits}
+# -----------------------------------------------------------------------------
+# PHASE 1: BUILD — CONTINUOUS TRAIT EVOLUTION
+# -----------------------------------------------------------------------------
+# Two continuous characters are simulated along the phylogeny using Brownian
+# Motion (BM) via phytools::fastBM(). BM is the standard null model for
+# continuous trait evolution: a trait drifts randomly through time with no
+# directional tendency, and variance accumulates proportionally to both the
+# evolutionary rate (sig2) and the path length from root to tip.
+#
+# fastBM() returns one species-level mean per taxon. These means represent
+# the evolved central tendency of each species and become the targets around
+# which individual specimens are sampled in Phase 2.
+#
+# Parameters:
+#   a    — ancestral root value (mm). Set to published averages for the
+#           relevant hominin measurement.
+#   sig2 — Brownian Motion rate (mm² / Ma). Controls how far apart species
+#           means drift per unit of branch length. Higher sig2 → larger
+#           between-species gaps → higher FST → easier clustering.
+#           sig2 values are varied systematically in the experiment framework.
+#
+# Trait 1: cranial measurement (proxy: palatal width, ~130 mm mean)
+# Trait 2: dental measurement  (proxy: M1 mesiodistal length, ~14 mm mean)
+#
+# The two traits are simulated independently. A more realistic model would
+# use a variance-covariance matrix to introduce trait correlation (see
+# mvMORPH or the vcv-based approach in fastBM), which is a possible
+# extension for post-dissertation work.
+# -----------------------------------------------------------------------------
+
+# Validation pass parameters (High FST: large sig2, tight within-species SD)
+# These match Experiment 1 in Table 3 and confirm the method works before
+# introducing more challenging conditions.
+sig2_cranial_val <- 100   # BM rate for cranial trait (Experiment 1: High FST)
+sig2_dental_val  <- 10    # BM rate for dental trait  (Experiment 1: High FST)
+
+continuous_1 <- fastBM(hominin_tree, a = 130,
+                        sig2 = sig2_cranial_val, nsim = 1)
+continuous_2 <- fastBM(hominin_tree, a = 14,
+                        sig2 = sig2_dental_val,  nsim = 1)
+
+cat("\n--- Evolved Species Means (Continuous Traits) ---\n")
+cat("Trait 1 — cranial (e.g. palatal width, mm):\n")
+print(round(continuous_1, 2))
+cat("\nTrait 2 — dental (e.g. M1 mesiodistal length, mm):\n")
+print(round(continuous_2, 2))
+cat("\nNote: values differ each run unless set.seed() is called (see above).\n")
+```
+
+## Discrete Trait Evolution (Mk Model)
+
+```{r phase1-discrete-traits}
+# -----------------------------------------------------------------------------
+# PHASE 1: BUILD — DISCRETE TRAIT EVOLUTION
+# -----------------------------------------------------------------------------
+# Two binary characters are simulated using the Mk (Markov k-state) model via
+# phytools::sim.Mk(). The Mk model is the discrete counterpart to Brownian
+# Motion: it describes the probability of a character transitioning between
+# states over evolutionary time using a rate matrix Q.
+#
+# For a binary character (states "0" and "1"):
+#   Q = | -q_rate   q_rate |
+#       |  q_rate  -q_rate |
+#
+# where q_rate is the instantaneous rate of transition between states.
+# Equal rates (q01 = q10) is the simplest symmetric model (analogous to
+# the Jukes-Cantor model in molecular evolution).
+#
+#   Low  q_rate → character rarely flips → strongly diagnostic
+#   High q_rate → character flips frequently → less discriminating power
+#
+# sim.Mk() returns a species-level state ("0" or "1") for each taxon.
+# In Phase 2, this state is used to set the Bernoulli probability that
+# any individual specimen expresses the character (see Phase 2 below).
+#
+# Character 1: presence/absence of supraorbital torus
+# Character 2: presence/absence of sagittal crest
+#
+# q_rate = 0.5 is used for the validation pass. This is varied as part of
+# the character-type experiment (Experiment 5).
+# -----------------------------------------------------------------------------
+
+q_rate <- 0.5
+
+Q_mk <- matrix(
+  c(-q_rate,  q_rate,
+     q_rate, -q_rate),
+  nrow     = 2,
+  byrow    = TRUE,
+  dimnames = list(c("0", "1"), c("0", "1"))
+)
+
+cat("--- Discrete Character Q Matrix (transition rates) ---\n")
+print(Q_mk)
+cat("\nDiagonal entries are negative (rate of leaving that state).\n")
+cat("Off-diagonal entries are the rate of gaining/losing the character.\n")
+
+discrete_1 <- sim.Mk(hominin_tree, Q = Q_mk, nsim = 1)
+discrete_2 <- sim.Mk(hominin_tree, Q = Q_mk, nsim = 1)
+
+cat("\n--- Evolved Species States (Discrete Traits) ---\n")
+cat("Character 1 — supraorbital torus (0 = absent, 1 = present):\n")
+print(discrete_1)
+cat("\nCharacter 2 — sagittal crest (0 = absent, 1 = present):\n")
+print(discrete_2)
+```
+
+---
+
+# Phase 2: Sample — Grounding and Specimen Simulation
+
+## Sampling Parameters
+
+```{r phase2-sampling-parameters}
+# -----------------------------------------------------------------------------
+# PHASE 2: SAMPLE — WITHIN-SPECIES VARIANCE AND SAMPLING PARAMETERS
+# -----------------------------------------------------------------------------
+# The evolved species means from Phase 1 are population-level targets. In this
+# phase, individual specimens are drawn around those targets using within-species
+# standard deviations anchored to published extant ape data (Table 2 above).
+#
+# ACTIVE BOUND
+# To switch between the three variance conditions, change active_bound to
+# "Low", "Med", or "High". The within_sd values update automatically from
+# the grounding table, so no other changes are needed.
+#
+#   "Low"  — Pan paniscus level; highly homogeneous assemblage
+#   "Med"  — Pan troglodytes level; best estimate for Australopithecus
+#   "High" — Gorilla gorilla level; highly dimorphic (e.g. Paranthropus)
+#
+# DENTAL WITHIN_SD SCALING RULE (from dissertation §Phase 2):
+# "The dental within_sd is scaled as within_sd_cranial / 7.5 across all
+# conditions to maintain realistic cranial-to-dental variation ratio
+# consistent with published primate data."
+# This rule is applied explicitly here so the ratio is transparent and
+# holds automatically when active_bound is switched.
+#
+# SAMPLE SIZES
+# n_specimens controls how many individual specimens are drawn per taxon.
+# In the validation pass all three taxa have n = 100. This is varied
+# systematically in Experiment 6 (Sample Size).
+# -----------------------------------------------------------------------------
+
+active_bound <- "Med"   # CHANGE TO "Low" or "High" for other FST conditions
+
+within_sd_cranial <- ground$SD_mm[
+  ground$Bound == active_bound & ground$Trait == "Cranial breadth"
+][1]
+
+# Dental SD derived from cranial SD by the prospectus scaling rule
+within_sd_dental <- round(within_sd_cranial / 7.5, 3)
+
+# Safety assertions — will halt immediately if grounding table has NAs
+stopifnot(
+  !is.na(within_sd_cranial),
+  !is.na(within_sd_dental),
+  length(within_sd_cranial) == 1,
+  length(within_sd_dental)  == 1
+)
+
+within_sd <- list(cranial = within_sd_cranial, dental = within_sd_dental)
+
+# Sample sizes per taxon — set to 100 for the validation pass
+n_specimens <- c(Taxon_1 = 100, Taxon_2 = 100, Taxon_3 = 100)
+
+cat("--- Sampling Parameters (Validation Pass) ---\n")
+cat("Active bound:", active_bound, "\n")
+cat("within_sd (cranial):", within_sd$cranial, "mm\n")
+cat("within_sd (dental): ", within_sd$dental,  "mm  [= cranial / 7.5]\n")
+cat("Sample sizes per taxon:",
+    paste(names(n_specimens), n_specimens, sep = " = ", collapse = ", "), "\n")
+```
+
+## Draw Individual Specimens
+
+```{r phase2-sample-specimens}
+# -----------------------------------------------------------------------------
+# PHASE 2: SAMPLE — DRAW INDIVIDUAL SPECIMENS
+# -----------------------------------------------------------------------------
+# For each taxon, n individual specimen values are drawn independently from
+# normal distributions centred on the taxon's evolved mean (from Phase 1),
+# with the within-species standard deviation set above.
+#
+# CONTINUOUS TRAITS
+# Each specimen's cranial and dental values are drawn from:
+#   value ~ Normal(taxon_mean, within_sd)
+# This places each specimen around its taxon's evolved mean, with natural
+# intraspecific variation added. All specimens of the same taxon share a
+# common mean but vary individually around it.
+#
+# DISCRETE TRAITS
+# The species-level Mk state ("0" or "1") sets a Bernoulli probability for
+# each individual specimen. Rather than making characters perfectly diagnostic
+# (which is unrealistic), a taxon in state "1" has an 85% chance of
+# expressing the character, while a taxon in state "0" has a 15% chance.
+# This models population-level tendencies and occasional polymorphism.
+#   p_high = 0.85  (taxon state "1" → most individuals express the character)
+#   p_low  = 0.15  (taxon state "0" → occasional expression, ~base rate)
+#
+# SEXUAL DIMORPHISM (currently inactive in validation pass)
+# The infrastructure for sex-based mean offsets is included but commented
+# out. It is activated parametrically in Experiments 8 and 13. See the
+# run_morphodelim_experiment() function in the Experiment Framework section.
+# -----------------------------------------------------------------------------
+
+p_high <- 0.85   # probability of expressing state "1" when taxon is in state "1"
+p_low  <- 0.15   # probability of expressing state "1" when taxon is in state "0"
+
+sample_taxon <- function(taxon_name, n, cranial_mean, dental_mean,
+                         sup_torus_state, sag_crest_state,
+                         within_sd) {
+
+  # Draw continuous trait values
+  cranial_vals <- rnorm(n, mean = cranial_mean, sd = within_sd$cranial)
+  dental_vals  <- rnorm(n, mean = dental_mean,  sd = within_sd$dental)
+
+  # Set Bernoulli probability from Mk-evolved species state
+  p_torus <- ifelse(sup_torus_state == "1", p_high, p_low)
+  p_crest <- ifelse(sag_crest_state == "1", p_high, p_low)
+
+  # Draw binary discrete trait values per specimen
+  torus_vals <- rbinom(n, size = 1, prob = p_torus)
+  crest_vals <- rbinom(n, size = 1, prob = p_crest)
+
+  data.frame(
+    specimen_id  = paste0(taxon_name, "_", sprintf("%03d", seq_len(n))),
+    true_species = taxon_name,
+    cranial      = round(cranial_vals, 2),
+    dental       = round(dental_vals,  2),
+    sup_torus    = torus_vals,
+    sag_crest    = crest_vals,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Build the combined specimen-level dataset across all three taxa
+all_specimens <- do.call(rbind, lapply(hominin_tree$tip.label, function(tx) {
+  sample_taxon(
+    taxon_name      = tx,
+    n               = n_specimens[tx],
+    cranial_mean    = unname(continuous_1[tx]),
+    dental_mean     = unname(continuous_2[tx]),
+    sup_torus_state = as.character(discrete_1[tx]),
+    sag_crest_state = as.character(discrete_2[tx]),
+    within_sd       = within_sd
+  )
+}))
+
+cat("--- Specimen Dataset (first 10 rows) ---\n")
+print(head(all_specimens, 10))
+cat("\nDimensions:", nrow(all_specimens), "specimens ×",
+    ncol(all_specimens), "columns\n")
+```
+
+## Within-Species Summary Statistics
+
+```{r phase2-summary-stats}
+# -----------------------------------------------------------------------------
+# PHASE 2: SAMPLE — WITHIN-SPECIES SUMMARY STATISTICS
+# -----------------------------------------------------------------------------
+# Summary statistics by taxon confirm that the simulated assemblage has the
+# expected structure:
+#   (a) Each taxon's sample mean approximates its evolved tip value from Phase 1
+#       (convergence improves with larger n).
+#   (b) Standard deviations approximate the intended within_sd values.
+#   (c) Discrete character frequencies reflect the 0.85 / 0.15 Bernoulli
+#       probabilities: a taxon in state "1" should show ~85% expression,
+#       a taxon in state "0" should show ~15% expression.
+# -----------------------------------------------------------------------------
+
+cat("--- Within-Taxon Summary Statistics ---\n")
+for (tx in hominin_tree$tip.label) {
+  sp <- all_specimens[all_specimens$true_species == tx, ]
+  cat("\n", tx, "(n =", nrow(sp), "):\n")
+  cat("  Cranial: mean =", round(mean(sp$cranial), 2),
+      " sd =",            round(sd(sp$cranial),   2),
+      " range =",         round(min(sp$cranial),  2), "–",
+                          round(max(sp$cranial),  2), "mm\n")
+  cat("  Dental:  mean =", round(mean(sp$dental),  2),
+      " sd =",            round(sd(sp$dental),    2),
+      " range =",         round(min(sp$dental),   2), "–",
+                          round(max(sp$dental),   2), "mm\n")
+  cat("  Supraorbital torus — frequency of state 1:",
+      round(mean(sp$sup_torus), 2), "\n")
+  cat("  Sagittal crest     — frequency of state 1:",
+      round(mean(sp$sag_crest), 2), "\n")
+}
+```
+
+## Morphospace Visualisation (True Labels — Figure 4, Left Panel)
+
+```{r phase2-morphospace, fig.width = 6, fig.height = 5}
+# -----------------------------------------------------------------------------
+# PHASE 2: SAMPLE — GROUND TRUTH MORPHOSPACE
+# -----------------------------------------------------------------------------
+# This plot shows the simulated specimen cloud in 2D continuous trait space
+# (cranial × dental) with specimens coloured and shaped by their true taxon.
+# The 95% confidence ellipses summarise the expected spread of each species.
+#
+# This is the "answer key" — the ideal result that perfect clustering would
+# recover. The degree of ellipse overlap sets the expectation for how
+# difficult the clustering problem is: heavy overlap means lower ARI is
+# expected even from a well-functioning algorithm.
+#
+# This panel corresponds to the left panel of Figure 4 in the dissertation.
+# -----------------------------------------------------------------------------
+
+TAXON_COLORS <- c(Taxon_1 = "#DF414D", Taxon_2 = "#86D43A", Taxon_3 = "#51BBE7")
+TAXON_SHAPES <- c(Taxon_1 = 15, Taxon_2 = 16, Taxon_3 = 17)
+
+plot_true <- ggplot(all_specimens,
+                    aes(x = cranial, y = dental,
+                        colour = true_species,
+                        shape  = true_species)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.7) +
+  scale_colour_manual(values = TAXON_COLORS) +
+  scale_shape_manual(values  = TAXON_SHAPES) +
+  labs(
+    title    = "True Taxa (Figure 4 — Left)",
+    subtitle = "95% confidence ellipses by true taxon",
+    x        = "Cranial measurement (mm)",
+    y        = "Dental measurement (mm)",
+    colour   = "True taxon",
+    shape    = "True taxon"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        legend.text   = element_text(face = "italic"),
+        legend.position = "bottom")
+
+print(plot_true)
+```
+
+---
+
+# Phase 3: Blind Analysis
+
+## Blinding the Dataset
+
+```{r phase3-blind}
+# -----------------------------------------------------------------------------
+# PHASE 3: BLIND ANALYSIS — REMOVE TRUE SPECIES LABELS
+# -----------------------------------------------------------------------------
+# The true_species column is removed from the dataset to create the 'blinded'
+# matrix that is passed to all clustering methods. This mimics the actual
+# conditions of fossil analysis: we can observe morphological measurements
+# but we do not know in advance which specimens belong to which species.
+#
+# The ground truth (all_specimens$true_species) is retained separately so
+# that ARI, confusion matrices, and Kappa can be computed after clustering.
+# -----------------------------------------------------------------------------
+
+blinded <- all_specimens[, !(names(all_specimens) %in%
+                                c("true_species", "specimen_id"))]
+
+# Feature matrix for Gower distance:
+# discrete traits must be factors so daisy() treats them as categorical
+cluster_features <- data.frame(
+  cranial   = blinded$cranial,
+  dental    = blinded$dental,
+  sup_torus = factor(blinded$sup_torus),
+  sag_crest = factor(blinded$sag_crest)
+)
+
+true_labels <- all_specimens$true_species
+
+cat("Blinded feature matrix (first 10 rows):\n")
+print(head(cluster_features, 10))
+cat("\nTotal specimens:", nrow(cluster_features), "\n")
+cat("True labels retained separately for evaluation.\n")
+```
+
+## Compute Gower Distance Matrix
+
+```{r phase3-gower-distance}
+# -----------------------------------------------------------------------------
+# PHASE 3: BLIND ANALYSIS — GOWER DISTANCE MATRIX
+# -----------------------------------------------------------------------------
+# Gower's distance (Gower, 1971) is the bridge between the specimen data and
+# all clustering methods in this analysis. It is chosen because it is the only
+# standard dissimilarity metric that natively accommodates both continuous
+# and discrete character types simultaneously, which is the defining constraint
+# of the hominin fossil record.
+#
+# For each pair of specimens, Gower's distance averages the per-character
+# dissimilarities:
+#   Continuous trait: |x_i - x_j| / range of that trait across all specimens
+#   Discrete trait:   0 if both specimens share the same state, 1 if different
+#   Missing value:    the character is excluded from that specimen pair's average
+#
+# The final Gower distance for any pair ranges from 0 (identical) to 1
+# (maximally dissimilar). Missing data is handled pairwise — only characters
+# where both specimens have a value contribute to that pair's distance.
+#
+# build_gower_matrix() (defined in the utility functions section) computes
+# the matrix and replaces any NA distances with the maximum observed distance.
+# NA distances arise only when two specimens share NAs on every character,
+# which should not occur in the validation pass but can arise at high levels
+# of missingness in the experiment framework.
+# -----------------------------------------------------------------------------
+
+gower_dist <- build_gower_matrix(cluster_features)
+
+cat("Gower distance matrix computed.\n")
+cat("Matrix dimensions:", nrow(as.matrix(gower_dist)), "×",
+    ncol(as.matrix(gower_dist)), "\n")
+cat("Distance range: [", round(min(gower_dist), 4), ",",
+    round(max(gower_dist), 4), "]\n")
+
+# Report empirical FST as verification that parameters produce the intended
+# FST level. FST is computed separately for each continuous trait and averaged.
+fst_cranial <- compute_empirical_fst(all_specimens$cranial, all_specimens$true_species)
+fst_dental  <- compute_empirical_fst(all_specimens$dental,  all_specimens$true_species)
+fst_mean    <- mean(c(fst_cranial, fst_dental))
+
+cat("\n--- Empirical FST (confirms intended variance partitioning) ---\n")
+cat(sprintf("  Cranial FST: %.4f\n", fst_cranial))
+cat(sprintf("  Dental FST:  %.4f\n", fst_dental))
+cat(sprintf("  Mean FST:    %.4f\n", fst_mean))
+cat("  (FST = 1 → non-overlapping; FST = 0 → indistinguishable)\n")
+```
+
+---
+
+# Delimitation Methods
+
+## MorphoDelim: Simultaneous Delimitation (Primary Method)
+
+```{r simultaneous-delimitation}
+# -----------------------------------------------------------------------------
+# MORPHODELIM — SIMULTANEOUS DELIMITATION (PRIMARY METHOD)
+# -----------------------------------------------------------------------------
+# The Simultaneous protocol applies PAM (Partitioning Around Medoids) with
+# k = 3 to the full specimen pool in a single step.
+#
+# PAM is chosen over k-means for two reasons:
+#   (1) It operates on any dissimilarity matrix, including Gower, whereas
+#       k-means requires Euclidean distance on numeric data only.
+#   (2) PAM's medoids are actual specimens from the dataset, making results
+#       more interpretable — each cluster is anchored to a real fossil.
+#
+# In Simultaneous delimitation, every specimen's cluster assignment is
+# determined relative to all other specimens at once. There is no imposed
+# discovery order and no anchoring specimen — this is the methodological
+# departure from traditional paleoanthropological practice that the
+# dissertation argues reduces anchoring bias.
+#
+# The argument k = 3 is used here because it matches the known number of
+# simulated taxa. In the Aim 3 fossil application, k will be selected
+# using the BIC-guided k-selection procedure (see Section 9 below).
+# -----------------------------------------------------------------------------
+
+pam_sim    <- pam(gower_dist, k = 3, diss = TRUE)
+pam_clusters <- pam_sim$clustering
+ari_pam    <- adjustedRandIndex(pam_clusters, true_labels)
+
+cat("--- PAM + Gower: Simultaneous Delimitation ---\n")
+cat("Contingency table (rows = PAM cluster, cols = true taxon):\n")
+print(table(PAM_cluster = pam_clusters, True_taxon = true_labels))
+cat(sprintf("\nAdjusted Rand Index (Simultaneous): %.4f\n", ari_pam))
+cat("  ARI = 1.0  → perfect recovery\n")
+cat("  ARI ≥ 0.80 → excellent\n")
+cat("  ARI < 0.40 → near random\n")
+```
+
+## MorphoDelim: Sequential Delimitation (Comparison Protocol)
+
+```{r sequential-delimitation}
+# -----------------------------------------------------------------------------
+# MORPHODELIM — SEQUENTIAL DELIMITATION (COMPARISON PROTOCOL)
+# -----------------------------------------------------------------------------
+# The Sequential protocol applies PAM in two steps, mirroring traditional
+# paleoanthropological practice in which the most morphologically distinct
+# taxon is identified before more similar taxa are compared.
+#
+# STEP 1: Isolate the outgroup
+#   PAM with k = 2 is applied to all specimens. The cluster containing the
+#   majority of Taxon 1 specimens is designated the outgroup cluster.
+#   All other specimens are passed to Step 2.
+#
+# STEP 2: Separate the sister pair
+#   PAM with k = 2 is applied to the Step 1 remainder pool to separate
+#   Taxon 2 from Taxon 3.
+#
+# KEY PREDICTION (Hypothesis 2.2):
+#   Misassignments in Step 1 contaminate the Step 2 specimen pool,
+#   compressing the morphological boundary between Taxon 2 and Taxon 3
+#   and reducing their combined ARI relative to Simultaneous delimitation.
+#   This error should be largest when Taxon 1 is not cleanly separated
+#   from the sister pair (i.e., when FST is low or within-species
+#   variation is high).
+# -----------------------------------------------------------------------------
+
+# Step 1: k=2 on full pool — expects one cluster ≈ Taxon 1
+pam_step1 <- pam(gower_dist, k = 2, diss = TRUE)
+ct_step1  <- table(pam_step1$clustering, true_labels)
+
+cat("--- Sequential Delimitation — Step 1 (k=2 on full pool) ---\n")
+print(ct_step1)
+
+# Identify the cluster with the most Taxon_1 specimens
+taxon1_cluster <- which.max(ct_step1[, "Taxon_1"])
+pool_cluster   <- setdiff(1:2, taxon1_cluster)
+pool_idx       <- which(pam_step1$clustering == pool_cluster)
+
+seq_labels <- rep(NA_character_, nrow(all_specimens))
+seq_labels[pam_step1$clustering == taxon1_cluster] <- "Taxon_1"
+
+# Step 2: k=2 on the remainder pool — expects one cluster ≈ Taxon 2,
+# the other ≈ Taxon 3
+gower_mat <- as.matrix(gower_dist)
+pool_gd   <- as.dist(gower_mat[pool_idx, pool_idx])
+pam_step2 <- pam(pool_gd, k = 2, diss = TRUE)
+ct_step2  <- table(pam_step2$clustering, true_labels[pool_idx])
+
+cat("\n--- Sequential Delimitation — Step 2 (k=2 on sister-pair pool) ---\n")
+print(ct_step2)
+
+taxon2_cluster <- which.max(ct_step2[, "Taxon_2"])
+taxon3_cluster <- setdiff(1:2, taxon2_cluster)
+
+seq_labels[pool_idx[pam_step2$clustering == taxon2_cluster]] <- "Taxon_2"
+seq_labels[pool_idx[pam_step2$clustering == taxon3_cluster]] <- "Taxon_3"
+
+ari_sequential    <- adjustedRandIndex(seq_labels,  true_labels)
+ari_simultaneous  <- ari_pam
+
+cat("\n--- Sequential vs. Simultaneous ARI Comparison ---\n")
+cat(sprintf("  Sequential ARI:   %.4f\n", ari_sequential))
+cat(sprintf("  Simultaneous ARI: %.4f\n", ari_simultaneous))
+cat(sprintf("  Difference (Seq - Sim): %.4f\n",
+            ari_sequential - ari_simultaneous))
+
+if (ari_sequential < ari_simultaneous) {
+  cat("  >> Simultaneous outperforms Sequential — anchoring bias detected.\n")
+} else if (ari_sequential > ari_simultaneous) {
+  cat("  >> Sequential outperforms Simultaneous.\n")
+} else {
+  cat("  >> Methods perform equivalently under these parameters.\n")
+}
+```
+
+## Figure 4: Three-Panel Delimitation Comparison
+
+```{r figure4, fig.width = 14, fig.height = 5}
+# -----------------------------------------------------------------------------
+# FIGURE 4 — THREE-PANEL DELIMITATION COMPARISON
+# -----------------------------------------------------------------------------
+# Left:   True Taxa (ground truth)
+# Centre: Sequential Delimitation result
+# Right:  Simultaneous Delimitation result
+#
+# The caption is constructed dynamically from the active parameter values
+# so that it remains accurate when active_bound or sig2 values are changed.
+# -----------------------------------------------------------------------------
+
+all_specimens$seq_label <- factor(seq_labels,
+                                   levels = c("Taxon_1","Taxon_2","Taxon_3"))
+
+fig_caption <- paste0(
+  "sig2 = ", sig2_cranial_val, " (cranial)  |  ",
+  "sig2 = ", sig2_dental_val,  " (dental)  |  ",
+  "Bound = ", active_bound, "  |  ",
+  "within_sd = ", within_sd$cranial, " mm (cranial), ",
+  round(within_sd$dental, 2), " mm (dental)  |  ",
+  "n = ", paste(n_specimens, collapse = "/"), " per taxon  |  ",
+  "Seq ARI = ", round(ari_sequential, 3),
+  "  |  Sim ARI = ", round(ari_simultaneous, 3)
+)
+
+# Centre panel — Sequential
+p_seq <- ggplot(all_specimens,
+                aes(x = cranial, y = dental,
+                    colour = seq_label, shape = seq_label)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.6) +
+  scale_colour_manual(values = TAXON_COLORS) +
+  scale_shape_manual(values  = TAXON_SHAPES) +
+  labs(title    = paste0("Sequential  (ARI = ", round(ari_sequential, 3), ")"),
+       subtitle = "Step 1: isolate outgroup | Step 2: split sister pair",
+       x = "Cranial (mm)", y = "Dental (mm)",
+       colour = NULL, shape = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.text     = element_text(face = "italic"))
+
+# Right panel — Simultaneous
+all_specimens$pam_cluster <- factor(pam_clusters)
+p_sim <- ggplot(all_specimens,
+                aes(x = cranial, y = dental,
+                    colour = pam_cluster, shape = pam_cluster)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.6) +
+  scale_colour_manual(values = c("1" = "#009E73",
+                                  "2" = "#D55E00",
+                                  "3" = "#0072B2")) +
+  scale_shape_manual(values  = c("1" = 15, "2" = 16, "3" = 17)) +
+  labs(title    = paste0("Simultaneous  (ARI = ", round(ari_simultaneous, 3), ")"),
+       subtitle = "One-shot PAM k = 3 on all specimens",
+       x = "Cranial (mm)", y = "Dental (mm)",
+       colour = "Cluster", shape = "Cluster") +
+  theme_bw(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "bottom")
+
+fig4 <- plot_true + p_seq + p_sim +
+  plot_annotation(
+    title   = "Figure 4. Hominin Species Delimitation — Proof-of-Concept",
+    caption = fig_caption,
+    theme   = theme(
+      plot.title   = element_text(face = "bold", size = 13),
+      plot.caption = element_text(size = 8, colour = "grey50")
+    )
+  )
+
+print(fig4)
+```
+
+---
+
+# Performance Evaluation
+
+## Confusion Matrix and Kappa (PAM Simultaneous)
+
+```{r confusion-matrix}
+# -----------------------------------------------------------------------------
+# PERFORMANCE EVALUATION — CONFUSION MATRIX AND KAPPA
+# -----------------------------------------------------------------------------
+# The Adjusted Rand Index (ARI) provides a single summary of cluster recovery.
+# The confusion matrix decomposes that summary into per-species detail,
+# revealing the specific pattern of misassignment (e.g., which taxon pairs
+# are most confused). Kappa provides a second agreement statistic derived
+# from the same confusion matrix totals, serving as a cross-check on ARI.
+#
+# ARI interpretation (Hubert & Arabie, 1985):
+#   ARI = 1.0  → perfect recovery of true groupings
+#   ARI ≥ 0.80 → excellent recovery
+#   ARI ≥ 0.60 → good recovery
+#   ARI < 0.40 → near random — delimitation unreliable
+#   ARI < 0.00 → worse than chance (rare)
+#
+# Kappa interpretation:
+#   κ > 0.80 → almost perfect agreement
+#   κ = 0.60–0.80 → substantial agreement
+#   κ < 0.40 → poor agreement
+#
+# align_labels() (defined in utility functions) maps integer cluster IDs to
+# species names by majority vote before passing to confusionMatrix().
+# -----------------------------------------------------------------------------
+
+aligned_labels <- align_labels(pam_clusters, true_labels)
+
+cm <- confusionMatrix(
+  factor(aligned_labels, levels = unique(true_labels)),
+  factor(true_labels,    levels = unique(true_labels))
+)
+
+cat("--- Confusion Matrix (PAM Simultaneous Delimitation) ---\n")
+print(cm$table)
+
+cat("\n--- Per-Species Performance ---\n")
+print(round(cm$byClass[, c("Sensitivity", "Specificity",
+                            "Precision",   "F1")], 4))
+
+cat("\n--- Overall Performance ---\n")
+cat(sprintf("  Accuracy: %.4f  (95%% CI: %.4f – %.4f)\n",
+            cm$overall["Accuracy"],
+            cm$overall["AccuracyLower"],
+            cm$overall["AccuracyUpper"]))
+cat(sprintf("  Kappa:    %.4f\n", cm$overall["Kappa"]))
+cat(sprintf("  ARI:      %.4f\n", ari_pam))
+```
+
+## Comparison Methods
+
+### Gaussian Mixture Model
+
+```{r comparison-gmm}
+# -----------------------------------------------------------------------------
+# COMPARISON METHOD: GAUSSIAN MIXTURE MODEL (continuous traits only)
+# -----------------------------------------------------------------------------
+# GMM is a model-based clustering approach that fits a mixture of multivariate
+# Gaussian distributions to the data. The number of components and covariance
+# structure are selected by the Bayesian Information Criterion (BIC).
+#
+# GMM is appropriate here because it models a mixture of multivariate normal
+# distributions with potentially different means and covariances — a natural
+# generative model for morphological variation within and between species.
+# BIC penalises model complexity, which is important given the small sample
+# sizes in real fossil datasets.
+#
+# GMM is applied to continuous traits only (cranial and dental measurements).
+# Because it cannot accommodate discrete characters, any ARI advantage for
+# MorphoDelim in matched conditions is directly attributable to the additional
+# signal from discrete characters.
+#
+# G = 3 is specified to match the known taxon count in the simulation.
+# In the Aim 3 fossil application, the optimal G is selected by BIC.
+# -----------------------------------------------------------------------------
+
+gmm_data   <- blinded[, c("cranial", "dental")]
+gmm_result <- Mclust(gmm_data, G = 3)
+gmm_clusters <- gmm_result$classification
+ari_gmm    <- adjustedRandIndex(gmm_clusters, true_labels)
+
+cat("--- Gaussian Mixture Model (continuous traits, G = 3) ---\n")
+cat("Selected covariance model:", gmm_result$modelName, "\n")
+cat("Contingency table:\n")
+print(table(GMM_cluster = gmm_clusters, True_taxon = true_labels))
+cat(sprintf("\nARI (GMM): %.4f\n", ari_gmm))
+```
+
+### k-means Clustering
+
+```{r comparison-kmeans}
+# -----------------------------------------------------------------------------
+# COMPARISON METHOD: k-MEANS CLUSTERING (continuous traits only)
+# -----------------------------------------------------------------------------
+# k-means partitions specimens by minimising total within-cluster sum of
+# squares using Euclidean distance. It assumes clusters of roughly equal
+# spherical variance — an assumption that may not hold in fossil assemblages
+# where different species have different morphological spreads.
+#
+# k-means is included as a simple, widely understood baseline. Because it
+# operates on Euclidean distance on continuous traits only, it cannot directly
+# accommodate discrete characters or missing data. Any performance gap between
+# k-means and MorphoDelim in matched conditions quantifies the contribution
+# of discrete characters and Gower's missing-data handling.
+#
+# nstart = 25 repeats the algorithm from 25 random starting configurations
+# and returns the best result, reducing sensitivity to initialisation.
+# -----------------------------------------------------------------------------
+
+km3    <- kmeans(gmm_data, centers = 3, nstart = 25)
+ari_km <- adjustedRandIndex(km3$cluster, true_labels)
+
+cat("--- k-means (continuous traits, k = 3) ---\n")
+print(table(kmeans = km3$cluster, True_taxon = true_labels))
+cat(sprintf("\nARI (k-means): %.4f\n", ari_km))
+```
+
+### Hierarchical Clustering
+
+```{r comparison-hierarchical, fig.width = 9, fig.height = 5}
+# -----------------------------------------------------------------------------
+# COMPARISON METHOD: HIERARCHICAL CLUSTERING (Gower distance)
+# -----------------------------------------------------------------------------
+# Hierarchical clustering is applied directly to the Gower dissimilarity
+# matrix using Ward's D2 linkage. Ward's D2 minimises the increase in
+# total within-cluster variance at each merge step, producing compact,
+# well-separated clusters that are directly comparable to PAM clusters.
+#
+# Because Hierarchical clustering and MorphoDelim both operate on the same
+# Gower distance matrix, any ARI difference between them is attributable
+# solely to the partitioning algorithm: PAM uses medoid-anchored partitions
+# while Ward uses greedy variance minimisation. Similar ARIs indicate the
+# Gower distance structure drives the result more than the choice of
+# partitioning method.
+#
+# The dendrogram is cut at k = 3 (known taxon count). In Aim 3, the cut
+# height will be chosen using the gap statistic or silhouette width.
+# -----------------------------------------------------------------------------
+
+hc_fit    <- hclust(gower_dist, method = "ward.D2")
+hc_labels <- cutree(hc_fit, k = 3)
+ari_hc    <- adjustedRandIndex(hc_labels, true_labels)
+
+cat("--- Hierarchical Clustering (Ward D2, k = 3) ---\n")
+print(table(HC_cluster = hc_labels, True_taxon = true_labels))
+cat(sprintf("\nARI (Hierarchical): %.4f\n", ari_hc))
+
+p_dend <- fviz_dend(
+  hc_fit, k = 3,
+  k_colors          = c("#DF414D", "#86D43A", "#51BBE7"),
+  color_labels_by_k = TRUE,
+  rect              = TRUE,
+  rect_fill         = TRUE,
+  rect_border       = c("#DF414D", "#86D43A", "#51BBE7"),
+  show_labels       = FALSE,
+  main              = paste0("Hierarchical Clustering (Ward D2) — ARI = ",
+                             round(ari_hc, 3)),
+  sub               = "Cut at k = 3  |  Gower dissimilarity",
+  ggtheme           = theme_bw(base_size = 11)
+)
+print(p_dend)
+```
+
+### Clique Analysis
+
+```{r comparison-clique, fig.width = 7, fig.height = 6}
+# -----------------------------------------------------------------------------
+# COMPARISON METHOD: CLIQUE ANALYSIS (Gower similarity network)
+# -----------------------------------------------------------------------------
+# Clique analysis identifies groups of specimens that are mutually similar
+# above a threshold, revealing whether specimens of the same species form
+# tightly interconnected morphological networks or whether individual
+# specimens bridge between species (indicating transitional morphologies).
+#
+# IMPLEMENTATION:
+#   1. Convert Gower dissimilarity to similarity: sim = 1 – dist
+#   2. Threshold at the median similarity (adaptive, data-driven).
+#      Two specimens are connected if similarity ≥ threshold.
+#   3. Find maximal cliques in the resulting graph via igraph::max_cliques().
+#      A maximal clique is a subset of mutually connected specimens that
+#      cannot be expanded by adding any further specimen.
+#   4. Assign each specimen to the clique in which it appears most often
+#      (plurality vote), then map clique IDs to species by majority vote.
+#   5. Evaluate recovery with ARI.
+#
+# The median threshold keeps the graph at ~50% edge density, which is
+# computationally manageable for n = 300. In the Aim 3 fossil application,
+# multiple thresholds should be tested to assess threshold sensitivity.
+# -----------------------------------------------------------------------------
+
+gower_mat    <- as.matrix(gower_dist)
+sim_mat      <- 1 - gower_mat
+diag(sim_mat) <- 0
+
+sim_threshold <- median(sim_mat[upper.tri(sim_mat)])
+cat(sprintf("Similarity threshold (median): %.4f\n", sim_threshold))
+
+adj_mat      <- (sim_mat >= sim_threshold) * 1L
+diag(adj_mat) <- 0
+
+g <- graph_from_adjacency_matrix(adj_mat, mode = "undirected")
+cat("Network:", vcount(g), "vertices |", ecount(g), "edges\n")
+
+cliques_list  <- max_cliques(g)
+cat("Maximal cliques found:", length(cliques_list), "\n")
+
+# Assign specimens to their most-frequent clique
+clique_votes <- matrix(0L, nrow = nrow(all_specimens), ncol = length(cliques_list))
+for (ci in seq_along(cliques_list)) {
+  clique_votes[as.integer(cliques_list[[ci]]), ci] <- 1L
+}
+clique_assign   <- apply(clique_votes, 1, which.max)
+clique_species  <- align_labels(clique_assign, true_labels)
+ari_clique      <- adjustedRandIndex(clique_assign, true_labels)
+
+cat("\nClique assignment contingency:\n")
+print(table(Clique = clique_species, True_taxon = true_labels))
+cat(sprintf("\nARI (Clique Analysis): %.4f\n", ari_clique))
+
+# Visualise the similarity network
+V(g)$true_species <- all_specimens$true_species
+V(g)$color        <- TAXON_COLORS[V(g)$true_species]
+
+set.seed(GLOBAL_SEED)
+layout_fr <- layout_with_fr(g)
+
+par(mar = c(2, 2, 3, 2))
+plot(g,
+     layout       = layout_fr,
+     vertex.size  = 3,
+     vertex.label = NA,
+     vertex.color = V(g)$color,
+     edge.color   = "grey80",
+     edge.width   = 0.4,
+     main = paste0("Clique Analysis — Similarity Network  (ARI = ",
+                   round(ari_clique, 3), ")"),
+     sub  = paste0("Threshold = ", round(sim_threshold, 3),
+                   "  |  Nodes coloured by true taxon"))
+legend("bottomleft", legend = names(TAXON_COLORS),
+       fill = TAXON_COLORS, bty = "n", title = "True taxon", cex = 0.8)
+```
+
+---
+
+# k-Selection: Justifying k = 3
+
+```{r k-selection, fig.width = 10, fig.height = 5}
+# -----------------------------------------------------------------------------
+# k-SELECTION: ELBOW PLOT AND BIC CURVE
+# -----------------------------------------------------------------------------
+# In the simulation, the true number of taxa (k = 3) is known. In the Aim 3
+# fossil application it is not. These two plots demonstrate how k would be
+# chosen in a blinded scenario where the answer is unknown:
+#
+# LEFT — Elbow plot (k-means WSS):
+#   Total within-cluster sum of squares always decreases as k increases,
+#   but the rate of improvement slows sharply at the true k. The "elbow"
+#   indicates the most parsimonious k. A clear elbow at k = 3 validates
+#   that the simulation parameters produce well-separated clusters.
+#
+# RIGHT — BIC curve (GMM via mclust):
+#   Each coloured line represents a different covariance model structure.
+#   Higher BIC is better; the peak of the best-performing model indicates
+#   the most statistically supported number of components. Alignment of
+#   the BIC peak with k = 3 confirms the model correctly identifies the
+#   true number of species.
+#
+# Both plots use only the continuous traits, which is appropriate here
+# because k-means and GMM require numeric input. In the Aim 3 application,
+# the silhouette width computed on the full Gower matrix (which includes
+# discrete traits) should also be examined.
+# -----------------------------------------------------------------------------
+
+cont_data <- blinded[, c("cranial", "dental")]
+
+# Elbow plot
+wss <- sapply(1:6, function(k) {
+  kmeans(cont_data, centers = k, nstart = 25)$tot.withinss
+})
+
+p_elbow <- ggplot(data.frame(k = 1:6, wss = wss), aes(x = k, y = wss)) +
+  geom_line(linewidth = 0.8, colour = "grey40") +
+  geom_point(size = 3, colour = "#E69F00") +
+  geom_vline(xintercept = 3, linetype = "dashed", colour = "#CC79A7") +
+  annotate("text", x = 3.2, y = max(wss) * 0.95,
+           label = "k = 3 (true)", hjust = 0, colour = "#CC79A7", size = 3.5) +
+  scale_x_continuous(breaks = 1:6) +
+  labs(title    = "Elbow Method (k-means WSS)",
+       subtitle = "Total within-cluster SS vs. k",
+       x = "Number of clusters (k)", y = "Total within-cluster SS") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# BIC curve
+bic_result <- mclustBIC(cont_data, G = 1:6)
+bic_df <- data.frame(
+  G     = rep(1:6, ncol(bic_result)),
+  BIC   = as.vector(bic_result),
+  model = rep(colnames(bic_result), each = 6)
+)
+bic_df <- bic_df[!is.na(bic_df$BIC), ]
+
+p_bic <- ggplot(bic_df, aes(x = G, y = BIC, colour = model, group = model)) +
+  geom_line(linewidth = 0.6, alpha = 0.7) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_vline(xintercept = 3, linetype = "dashed", colour = "#CC79A7") +
+  annotate("text", x = 3.2, y = max(bic_df$BIC, na.rm = TRUE),
+           label = "G = 3 (true)", hjust = 0, colour = "#CC79A7", size = 3.5) +
+  scale_x_continuous(breaks = 1:6) +
+  labs(title    = "mclust BIC (GMM component selection)",
+       subtitle = "Higher BIC = better model",
+       x = "Number of components (G)", y = "BIC", colour = "Model") +
+  theme_bw(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        legend.text   = element_text(size = 7),
+        legend.position = "right")
+
+print(p_elbow + p_bic +
+        plot_annotation(
+          title = "k / G Selection Diagnostics",
+          theme = theme(plot.title = element_text(face = "bold", size = 13))
+        ))
+```
+
+---
+
+# Missing Data Analysis (Experiment 7 — Single-Pass Preview)
+
+```{r missing-data, fig.width = 7, fig.height = 5}
+# -----------------------------------------------------------------------------
+# MISSING DATA: FOSSIL FRAGMENTATION (EXPERIMENT 7 PREVIEW)
+# -----------------------------------------------------------------------------
+# Fossil specimens are rarely complete. This section quantifies how ARI
+# degrades as a function of trait incompleteness under MCAR missingness.
+#
+# Two imputation strategies are compared:
+#   (a) Gower native NA — missing pairs receive the maximum observed distance
+#       (worst-case assumption: maximally dissimilar). No information is added.
+#   (b) Median/mode imputation — NAs are replaced by the median (continuous)
+#       or mode (discrete) before computing the Gower matrix. This adds
+#       information, which can help or hurt depending on whether the imputed
+#       value happens to align with the true cluster.
+#
+# Missingness levels tested: 10%, 30%, 50% of all trait cells set to NA.
+# These correspond to the approximate preservation frequencies reported for
+# Australopithecus (cranial: ~10–18%; dental: ~48–83%) and Paranthropus
+# (cranial: ~15–23%; dental: ~63–81%) in Johnson (2024) and McRae & Wood (2025).
+#
+# NOTE: The full 100-replicate version of this experiment is run in the
+# Experiment Framework section (Experiment 7). This single-pass preview is
+# included here to show the pattern before the systematic loop.
+# -----------------------------------------------------------------------------
+
+trait_cols   <- c("cranial", "dental", "sup_torus", "sag_crest")
+miss_levels  <- c(0.10, 0.30, 0.50)
+
+results_missing <- data.frame(
+  p_miss       = numeric(),
+  pct_missing  = character(),
+  ARI_gower_na = numeric(),
+  ARI_imputed  = numeric()
+)
+
+for (p in miss_levels) {
+  blinded_missing <- introduce_missing(
+    df   = all_specimens[, c("specimen_id", trait_cols)],
+    cols = trait_cols,
+    p_miss = p,
+    seed = 99 + which(miss_levels == p)   # deterministic per level
+  )
+
+  # Strategy (a): Gower native NA handling
+  gower_na <- build_gower_matrix(data.frame(
+    cranial   = blinded_missing$cranial,
+    dental    = blinded_missing$dental,
+    sup_torus = factor(blinded_missing$sup_torus),
+    sag_crest = factor(blinded_missing$sag_crest)
+  ))
+  pam_na  <- pam(gower_na, k = 3, diss = TRUE)
+  ari_na  <- adjustedRandIndex(pam_na$clustering, true_labels)
+
+  # Strategy (b): median/mode imputation before clustering
+  blinded_imp <- impute_median_mode(blinded_missing,
+                                    cont_cols = c("cranial", "dental"),
+                                    disc_cols = c("sup_torus", "sag_crest"))
+  gower_imp   <- build_gower_matrix(data.frame(
+    cranial   = blinded_imp$cranial,
+    dental    = blinded_imp$dental,
+    sup_torus = factor(blinded_imp$sup_torus),
+    sag_crest = factor(blinded_imp$sag_crest)
+  ))
+  pam_imp <- pam(gower_imp, k = 3, diss = TRUE)
+  ari_imp <- adjustedRandIndex(pam_imp$clustering, true_labels)
+
+  results_missing <- rbind(results_missing, data.frame(
+    p_miss      = p,
+    pct_missing = paste0(round(p * 100), "%"),
+    ARI_gower_na = ari_na,
+    ARI_imputed  = ari_imp
+  ))
+}
+
+# Add complete-data baseline
+results_missing <- rbind(
+  data.frame(p_miss = 0, pct_missing = "0%",
+             ARI_gower_na = ari_pam, ARI_imputed = ari_pam),
+  results_missing
+)
+
+cat("--- Missing Data ARI Summary ---\n")
+print(results_missing)
+
+# Plot ARI degradation curve
+miss_long <- reshape(results_missing,
+                     varying   = c("ARI_gower_na", "ARI_imputed"),
+                     v.names   = "ARI",
+                     timevar   = "Method",
+                     times     = c("Gower (native NA)", "Median imputed"),
+                     direction = "long")
+miss_long$p_miss <- as.numeric(miss_long$p_miss)
+
+ggplot(miss_long, aes(x = p_miss * 100, y = ARI,
+                       colour = Method, shape = Method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey60") +
+  geom_hline(yintercept = 0.40, linetype = "dotted", colour = "grey60") +
+  geom_hline(yintercept = 0.00, linetype = "solid",  colour = "grey80") +
+  annotate("text", x = 1, y = 0.82, label = "ARI = 0.80 (excellent)",
+           hjust = 0, size = 3, colour = "grey50") +
+  annotate("text", x = 1, y = 0.42, label = "ARI = 0.40 (near random)",
+           hjust = 0, size = 3, colour = "grey50") +
+  scale_x_continuous(breaks = c(0, 10, 30, 50),
+                     labels = c("0%", "10%", "30%", "50%")) +
+  scale_colour_manual(values = c("Gower (native NA)" = "#0072B2",
+                                  "Median imputed"    = "#D55E00")) +
+  scale_shape_manual(values  = c("Gower (native NA)" = 16,
+                                  "Median imputed"    = 17)) +
+  labs(title    = "ARI Degradation Under Fossil Fragmentation",
+       subtitle = "PAM + Gower, k = 3  |  MCAR missingness",
+       x = "Proportion of trait values missing (%)",
+       y = "Adjusted Rand Index (ARI)",
+       colour = "Strategy", shape = "Strategy") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+```
+
+---
+
+# Experiment Framework: Table 3
+
+```{r experiment-framework, cache = TRUE}
+# -----------------------------------------------------------------------------
+# SYSTEMATIC EXPERIMENT FRAMEWORK — TABLE 3
+# -----------------------------------------------------------------------------
+# This section runs all 13 experiments from Table 3 of the dissertation, each
+# with n_sim = 100 replicates. Results are summarised as mean ± SD ARI for
+# both the Sequential and Simultaneous delimitation protocols.
+#
+# Each replicate is assigned a deterministic per-replicate seed derived from
+# the global seed and the replicate number (GLOBAL_SEED + replicate_index).
+# This ensures:
+#   (a) Full reproducibility: the same seed produces the same ARI table.
+#   (b) Genuine Monte Carlo variation: results across the 100 replicates
+#       are not all identical — each replicate gets a fresh draw.
+# If GLOBAL_SEED is changed at the top of the document, all experiment
+# results update consistently.
+#
+# cache = TRUE is set for this chunk so that the 100-replicate loop does not
+# re-run on every knit. Delete the _cache folder to force a fresh run.
+#
+# EXPERIMENT DESCRIPTIONS (Table 3):
+#
+#   Experiments 1–3: FST Sensitivity
+#     Vary sigma² (between-species divergence rate) and within_sd
+#     (within-species variation) to identify the minimum FST threshold at
+#     which MorphoDelim reliably recovers species boundaries.
+#       Exp 1: High FST   — sigma² = 100/10, within_sd = 3 mm
+#       Exp 2: Moderate FST — sigma² = 50/5,  within_sd = 6 mm
+#       Exp 3: Low FST    — sigma² = 10/1,  within_sd = 9 mm
+#
+#   Experiment 4: Anchoring Bias Test
+#     Sequential vs. Simultaneous at Moderate FST. Directly tests
+#     Hypothesis 2.2: sequential delimitation accumulates error when
+#     the outgroup is not cleanly separated.
+#
+#   Experiment 5: Character Type Comparison
+#     Mixed data (continuous + discrete) vs. continuous traits only.
+#     Quantifies the contribution of discrete characters to recovery.
+#
+#   Experiments 6–10: Realistic Fossil Conditions
+#     Each fossil-record constraint is varied independently at Moderate FST:
+#       Exp 6:  Sample size (n = 20, 25, 50, 100 per taxon)
+#       Exp 7:  Missing data (10%, 30%, 50% MCAR)
+#       Exp 8:  Sexual dimorphism (none, 0.5 × SD, 1.0 × SD offset)
+#       Exp 9:  Geography (none, 0.5 × SD, 1.0 × SD sub-group offset)
+#       Exp 10: Anagenesis (directional drift within Taxon 2)
+#
+#   Experiments 11–13: Combined Parameters
+#     Exp 11: Worst Case — small n, high missing, high dimorphism
+#     Exp 12: Australopithecus Case — moderate on all parameters
+#     Exp 13: Paranthropus Case — high dimorphism + high geography + High FST
+# -----------------------------------------------------------------------------
+
+n_sim <- 100   # replicates per condition (set to 10 for a quick test run)
+
+# =============================================================================
+# CORE SIMULATION FUNCTION
+# =============================================================================
+# run_morphodelim_experiment() encapsulates one complete simulation replicate:
+#   Build phylogeny → simulate traits → sample specimens → apply missingness
+#   → compute Gower distance → run both delimitation protocols → return ARIs.
+#
+# Every parameter that varies across Table 3 is an argument to this function.
+# All arguments have sensible defaults (the Moderate FST validation-pass values)
+# so individual experiments override only the parameters they are testing.
+# =============================================================================
+
+run_morphodelim_experiment <- function(
+    sig2_cranial  = 50,    # BM rate for cranial trait
+    sig2_dental   = 5,     # BM rate for dental trait (= sig2_cranial / 10)
+    within_sd_cr  = 6.0,   # within-species SD, cranial (mm)
+    n_per_taxon   = 100,   # specimens per taxon (equal across taxa for simplicity)
+    p_missing     = 0.0,   # proportion of trait values set to NA (MCAR)
+    dimorphism_cr = 0.0,   # cranial sex offset: males = mean + offset/2
+    dimorphism_dt = 0.0,   # dental sex offset
+    sex_ratio     = 0.5,   # proportion male (used only when dimorphism > 0)
+    geo_offset_cr = 0.0,   # cranial sub-group geography offset
+    geo_offset_dt = 0.0,   # dental sub-group geography offset
+    geo_prop      = 0.5,   # proportion of specimens in geographic sub-group B
+    anagen_slope  = 0.0,   # anagenetic temporal drift rate (added to Taxon_2)
+    mixed_data    = TRUE,  # TRUE = 4 traits; FALSE = continuous only
+    rep_seed      = NULL   # per-replicate seed for reproducibility
+) {
+
+  if (!is.null(rep_seed)) set.seed(rep_seed)
+
+  # -- Build phylogeny --
+  tree <- read.tree(text = "(Taxon_1:2.0,(Taxon_2:1.0,Taxon_3:1.0):1.0);")
+
+  # -- Simulate continuous trait evolution (Brownian Motion) --
+  cont1 <- fastBM(tree, a = 130, sig2 = sig2_cranial, nsim = 1)
+  cont2 <- fastBM(tree, a = 14,  sig2 = sig2_dental,  nsim = 1)
+
+  # -- Simulate discrete trait evolution (Mk model) --
+  q_rate <- 0.5
+  Q_mk   <- matrix(c(-q_rate, q_rate, q_rate, -q_rate), 2, 2,
+                   dimnames = list(c("0","1"), c("0","1")))
+  disc1  <- sim.Mk(tree, Q = Q_mk, nsim = 1)
+  disc2  <- sim.Mk(tree, Q = Q_mk, nsim = 1)
+
+  # Dental SD from cranial SD via the prospectus scaling rule
+  within_sd_dt <- within_sd_cr / 7.5
+
+  # -- Sample individual specimens --
+  p_high <- 0.85; p_low <- 0.15
+
+  specimens <- do.call(rbind, lapply(tree$tip.label, function(tx) {
+    n        <- n_per_taxon
+    cr_mean  <- unname(cont1[tx])
+    dt_mean  <- unname(cont2[tx])
+
+    # Sexual dimorphism: male mean = taxon_mean + offset/2
+    #                   female mean = taxon_mean - offset/2
+    # Grand mean is preserved when sex_ratio = 0.5
+    if (dimorphism_cr > 0) {
+      sex     <- rbinom(n, 1, sex_ratio)
+      cr_vals <- rnorm(n,
+                       cr_mean + ifelse(sex == 1,  dimorphism_cr/2, -dimorphism_cr/2),
+                       within_sd_cr)
+      dt_vals <- rnorm(n,
+                       dt_mean + ifelse(sex == 1,  dimorphism_dt/2, -dimorphism_dt/2),
+                       within_sd_dt)
+    } else {
+      cr_vals <- rnorm(n, cr_mean, within_sd_cr)
+      dt_vals <- rnorm(n, dt_mean, within_sd_dt)
+    }
+
+    # Geography: a sub-group of specimens (geo_prop) receives a mean offset
+    # simulating morphological divergence across geographic populations within
+    # a single species.
+    if (geo_offset_cr > 0) {
+      is_b         <- as.logical(rbinom(n, 1, geo_prop))
+      cr_vals[is_b] <- cr_vals[is_b] + geo_offset_cr
+      dt_vals[is_b] <- dt_vals[is_b] + geo_offset_dt
+    }
+
+    # Anagenesis: a directional drift is added to Taxon_2 specimens
+    # proportional to their relative temporal position within the lineage.
+    # This simulates gradual morphological change through time within one species.
+    if (anagen_slope > 0 && tx == "Taxon_2") {
+      time_pts <- runif(n, 0, 1)
+      cr_vals  <- cr_vals + anagen_slope * time_pts
+    }
+
+    p_s  <- ifelse(as.character(disc1[tx]) == "1", p_high, p_low)
+    p_sc <- ifelse(as.character(disc2[tx]) == "1", p_high, p_low)
+
+    data.frame(
+      true_species = tx,
+      cranial      = round(cr_vals, 2),
+      dental       = round(dt_vals, 2),
+      sup_torus    = rbinom(n, 1, p_s),
+      sag_crest    = rbinom(n, 1, p_sc),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  true_labels <- specimens$true_species
+
+  # -- Apply MCAR missingness --
+  if (p_missing > 0) {
+    for (col in c("cranial", "dental", "sup_torus", "sag_crest")) {
+      n_miss           <- rbinom(1, nrow(specimens), p_missing)
+      miss_idx         <- sample(nrow(specimens), n_miss, replace = FALSE)
+      specimens[miss_idx, col] <- NA
+    }
+  }
+
+  # -- Build Gower distance matrix --
+  if (mixed_data) {
+    feat <- data.frame(
+      cranial   = specimens$cranial,
+      dental    = specimens$dental,
+      sup_torus = factor(specimens$sup_torus),
+      sag_crest = factor(specimens$sag_crest)
+    )
+  } else {
+    feat <- data.frame(cranial = specimens$cranial, dental = specimens$dental)
+  }
+
+  gd <- build_gower_matrix(feat)
+
+  # -- Simultaneous delimitation: PAM k=3, one step --
+  pam_sim <- pam(gd, k = 3, diss = TRUE)
+  ari_sim <- adjustedRandIndex(pam_sim$clustering, true_labels)
+
+  # -- Sequential delimitation: PAM k=2 twice --
+  gd_mat  <- as.matrix(gd)
+  pam2s1  <- pam(gd, k = 2, diss = TRUE)
+  ct1     <- table(pam2s1$clustering, true_labels)
+  t1_cl   <- which.max(ct1[, "Taxon_1"])
+  pool_idx <- which(pam2s1$clustering != t1_cl)
+
+  seq_lab <- rep(NA_character_, nrow(specimens))
+  seq_lab[pam2s1$clustering == t1_cl] <- "Taxon_1"
+
+  if (length(pool_idx) > 1) {
+    pool_gd  <- as.dist(gd_mat[pool_idx, pool_idx])
+    k2       <- min(2, length(unique(true_labels[pool_idx])))
+    pam2s2   <- pam(pool_gd, k = k2, diss = TRUE)
+    ct2      <- table(pam2s2$clustering, true_labels[pool_idx])
+    t2_cl    <- which.max(ct2[, "Taxon_2"])
+    t3_cl    <- setdiff(seq_len(k2), t2_cl)
+    seq_lab[pool_idx[pam2s2$clustering == t2_cl]] <- "Taxon_2"
+    seq_lab[pool_idx[pam2s2$clustering == t3_cl]] <- "Taxon_3"
+  }
+
+  ari_seq <- adjustedRandIndex(seq_lab, true_labels)
+
+  list(ari_simultaneous = ari_sim, ari_sequential = ari_seq,
+       fst_cranial = compute_empirical_fst(specimens$cranial, true_labels),
+       fst_dental  = compute_empirical_fst(specimens$dental,  true_labels))
+}
+
+# =============================================================================
+# HELPER: run n_sim replicates for one experiment condition
+# =============================================================================
+# Each replicate receives a deterministic seed = GLOBAL_SEED + replicate_index.
+# This ensures reproducibility across runs while preserving genuine Monte Carlo
+# variation across the 100 replicates within each condition.
+# =============================================================================
+
+run_experiment <- function(label, ...) {
+  raw <- lapply(seq_len(n_sim), function(i) {
+    run_morphodelim_experiment(..., rep_seed = GLOBAL_SEED + i)
+  })
+  data.frame(
+    Experiment      = label,
+    ARI_Sim_mean    = round(mean(sapply(raw, `[[`, "ari_simultaneous")), 4),
+    ARI_Sim_sd      = round(sd(sapply(raw,   `[[`, "ari_simultaneous")), 4),
+    ARI_Seq_mean    = round(mean(sapply(raw, `[[`, "ari_sequential")),   4),
+    ARI_Seq_sd      = round(sd(sapply(raw,   `[[`, "ari_sequential")),   4),
+    FST_mean        = round(mean(c(
+      sapply(raw, `[[`, "fst_cranial"),
+      sapply(raw, `[[`, "fst_dental")
+    )), 4)
+  )
+}
+
+# =============================================================================
+# RUN ALL 13 EXPERIMENTS
+# =============================================================================
+
+cat("Running 13 experiments (", n_sim, "replicates each)...\n")
+
+exp_results <- rbind(
+
+  # Experiments 1–3: FST Sensitivity
+  run_experiment("Exp 1 – High FST",
+                 sig2_cranial = 100, sig2_dental = 10, within_sd_cr = 3.0),
+  run_experiment("Exp 2 – Moderate FST",
+                 sig2_cranial = 50,  sig2_dental = 5,  within_sd_cr = 6.0),
+  run_experiment("Exp 3 – Low FST",
+                 sig2_cranial = 10,  sig2_dental = 1,  within_sd_cr = 9.0),
+
+  # Experiment 4: Anchoring Bias Test
+  run_experiment("Exp 4 – Anchoring Bias (Mod FST)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0),
+
+  # Experiment 5: Character Type (mixed vs. continuous only)
+  run_experiment("Exp 5a – Mixed data",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 mixed_data   = TRUE),
+  run_experiment("Exp 5b – Continuous only",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 mixed_data   = FALSE),
+
+  # Experiment 6: Sample Size
+  run_experiment("Exp 6a – n = 20",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon  = 20),
+  run_experiment("Exp 6b – n = 25",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon  = 25),
+  run_experiment("Exp 6c – n = 50",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon  = 50),
+  run_experiment("Exp 6d – n = 100",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon  = 100),
+
+  # Experiment 7: Missing Data
+  run_experiment("Exp 7a – 10% missing",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 p_missing    = 0.10),
+  run_experiment("Exp 7b – 30% missing",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 p_missing    = 0.30),
+  run_experiment("Exp 7c – 50% missing",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 p_missing    = 0.50),
+
+  # Experiment 8: Sexual Dimorphism
+  run_experiment("Exp 8a – No dimorphism",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 dimorphism_cr = 0.0, dimorphism_dt = 0.0),
+  run_experiment("Exp 8b – Moderate dimorphism (0.5 × SD)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 dimorphism_cr = 0.5 * 6.0, dimorphism_dt = 0.5 * (6.0 / 7.5)),
+  run_experiment("Exp 8c – High dimorphism (1.0 × SD)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 dimorphism_cr = 1.0 * 6.0, dimorphism_dt = 1.0 * (6.0 / 7.5)),
+
+  # Experiment 9: Geography
+  run_experiment("Exp 9a – No geography",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 geo_offset_cr = 0.0, geo_offset_dt = 0.0),
+  run_experiment("Exp 9b – Moderate geography (0.5 × SD)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 geo_offset_cr = 0.5 * 6.0, geo_offset_dt = 0.5 * (6.0 / 7.5)),
+  run_experiment("Exp 9c – High geography (1.0 × SD)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 geo_offset_cr = 1.0 * 6.0, geo_offset_dt = 1.0 * (6.0 / 7.5)),
+
+  # Experiment 10: Anagenesis
+  run_experiment("Exp 10 – Anagenesis (slope = 5)",
+                 sig2_cranial = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 anagen_slope = 5.0),
+
+  # Experiment 11: Worst Case
+  run_experiment("Exp 11 – Worst Case",
+                 sig2_cranial  = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon   = 20,
+                 p_missing     = 0.50,
+                 dimorphism_cr = 1.0 * 6.0, dimorphism_dt = 1.0 * (6.0 / 7.5)),
+
+  # Experiment 12: Australopithecus Case
+  run_experiment("Exp 12 – Australopithecus",
+                 sig2_cranial  = 50, sig2_dental = 5, within_sd_cr = 6.0,
+                 n_per_taxon   = 50,
+                 p_missing     = 0.30,
+                 dimorphism_cr = 0.5 * 6.0, dimorphism_dt = 0.5 * (6.0 / 7.5),
+                 geo_offset_cr = 0.5 * 6.0, geo_offset_dt = 0.5 * (6.0 / 7.5)),
+
+  # Experiment 13: Paranthropus Case
+  # Uses High FST bound (within_sd = 9 mm) to reflect strong sexual
+  # dimorphism and geographic subdivision documented for this genus (Dykes, 2016).
+  run_experiment("Exp 13 – Paranthropus",
+                 sig2_cranial  = 50, sig2_dental = 5, within_sd_cr = 9.0,
+                 n_per_taxon   = 50,
+                 p_missing     = 0.30,
+                 dimorphism_cr = 1.0 * 9.0, dimorphism_dt = 1.0 * (9.0 / 7.5),
+                 geo_offset_cr = 1.0 * 9.0, geo_offset_dt = 1.0 * (9.0 / 7.5))
+)
+
+rownames(exp_results) <- NULL
+cat("\n=== EXPERIMENT RESULTS (Table 3) ===\n")
+kable(exp_results,
+      col.names = c("Experiment", "ARI Sim (mean)", "ARI Sim (SD)",
+                    "ARI Seq (mean)", "ARI Seq (SD)", "FST (mean)"),
+      caption   = "Table 3. Mean ARI ± SD across 100 replicates for each experiment condition.",
+      align     = "lrrrrr",
+      digits    = 4)
+```
+
+```{r experiment-plot, fig.width = 10, fig.height = 9}
+# -----------------------------------------------------------------------------
+# EXPERIMENT FRAMEWORK FIGURE
+# -----------------------------------------------------------------------------
+# Each row represents one simulation condition from Table 3.
+# Points: mean ARI across 100 replicates.
+# Error bars: ± 1 standard error (SD / sqrt(n_sim)).
+# Blue circles: Simultaneous protocol.
+# Orange triangles: Sequential protocol.
+#
+# Reference lines:
+#   ARI ≥ 0.80 (dashed) — "excellent" recovery threshold from the prospectus.
+#   ARI < 0.40 (dotted) — near-random; delimitation unreliable.
+#
+# Experiments where Sequential ARI < Simultaneous ARI confirm Hypothesis 2.2
+# (anchoring bias reduces sequential performance). The minimum FST threshold
+# is identified as the condition where both protocols fall below ARI = 0.80.
+# -----------------------------------------------------------------------------
+
+exp_long <- reshape(exp_results,
+                    varying   = c("ARI_Sim_mean", "ARI_Seq_mean"),
+                    v.names   = "ARI_mean",
+                    timevar   = "Protocol",
+                    times     = c("Simultaneous", "Sequential"),
+                    direction = "long")
+
+exp_long$SD       <- ifelse(exp_long$Protocol == "Simultaneous",
+                             rep(exp_results$ARI_Sim_sd, 2)[seq_len(nrow(exp_long))],
+                             rep(exp_results$ARI_Seq_sd, 2)[seq_len(nrow(exp_long))])
+exp_long$SE       <- exp_long$SD / sqrt(n_sim)
+exp_long$Experiment <- factor(exp_long$Experiment,
+                               levels = rev(exp_results$Experiment))
+
+ggplot(exp_long, aes(x = ARI_mean, y = Experiment,
+                      colour = Protocol, shape = Protocol)) +
+  geom_point(size = 2.5, position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = ARI_mean - SE, xmax = ARI_mean + SE),
+                 height = 0.35, position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0.80, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 0.40, linetype = "dotted", colour = "grey55") +
+  annotate("text", x = 0.81, y = 1.0,
+           label = "ARI ≥ 0.80", hjust = 0, size = 2.8, colour = "grey45") +
+  annotate("text", x = 0.41, y = 1.0,
+           label = "ARI < 0.40", hjust = 0, size = 2.8, colour = "grey45") +
+  scale_colour_manual(values = c(Simultaneous = "#0072B2", Sequential = "#D55E00")) +
+  scale_shape_manual(values  = c(Simultaneous = 16, Sequential = 17)) +
+  scale_x_continuous(limits = c(-0.1, 1.05), breaks = seq(0, 1, 0.2)) +
+  labs(
+    title    = "MorphoDelim — Experiment Framework Results (Table 3)",
+    subtitle = paste0("Mean ARI ± SE  |  ", n_sim, " replicates per condition  |  seed = ",
+                      GLOBAL_SEED),
+    x = "Adjusted Rand Index (ARI)",
+    y = NULL,
+    colour = "Protocol", shape = "Protocol"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "bottom",
+        axis.text.y     = element_text(size = 8))
+```
+
+---
+
+# Full Method Comparison Summary
+
+```{r full-summary}
+# -----------------------------------------------------------------------------
+# FULL SUMMARY TABLE
+# -----------------------------------------------------------------------------
+# Consolidates all single-pass ARI and accuracy values from the validation run.
+# This table corresponds to the "proof-of-concept" results in the dissertation
+# (Simulation Validation, §Aim 2), confirming the method works correctly under
+# known, well-separated conditions before being applied to real fossil data.
+# -----------------------------------------------------------------------------
+
+cat("=== VALIDATION PASS — FULL RESULTS SUMMARY ===\n")
+cat(sprintf("  %-50s ARI = %.4f\n",  "PAM + Gower, Simultaneous (primary):", ari_pam))
+cat(sprintf("  %-50s ARI = %.4f\n",  "PAM + Gower, Sequential:",             ari_sequential))
+cat(sprintf("  %-50s ARI = %.4f\n",  "GMM, G = 3 (continuous only):",        ari_gmm))
+cat(sprintf("  %-50s ARI = %.4f\n",  "k-means, k = 3 (continuous only):",    ari_km))
+cat(sprintf("  %-50s ARI = %.4f\n",  "Hierarchical clustering (Ward D2):",   ari_hc))
+cat(sprintf("  %-50s ARI = %.4f\n",  "Clique analysis:",                      ari_clique))
+cat(sprintf("  %-50s κ   = %.4f\n",  "Kappa (PAM Simultaneous):",
+            cm$overall["Kappa"]))
+cat(sprintf("  %-50s Acc = %.4f\n",  "Overall Accuracy (PAM Simultaneous):",
+            cm$overall["Accuracy"]))
+
+cat("\nMissing data degradation (single-pass preview):\n")
+print(results_missing[, c("pct_missing", "ARI_gower_na", "ARI_imputed")])
+
+cat(sprintf("\nEmpirical FST (validation pass): %.4f (cranial), %.4f (dental)\n",
+            fst_cranial, fst_dental))
+```
+
+---
+
+# Aim 3: Fossil Application Stubs
+
+```{r aim3-extant-precheck-stub}
+# =============================================================================
+# AIM 3 — PRE-CHECK: EXTANT PRIMATE VALIDATION
+# =============================================================================
+# DESCRIPTION:
+#   Before applying MorphoDelim to fossil hominin data, a ground-truthing
+#   step is conducted using extant primate taxa with known, accepted species
+#   boundaries. This validates that MorphoDelim recovers correct assignments
+#   on real biological data before the fossil application where ground truth
+#   is unavailable.
+#
+# PRE-CHECK PHASE 1 — Great Apes (high FST, expected easy recovery):
+#   Data source: Mongle et al. (2019) character matrix.
+#   Species: Pan paniscus, Pan troglodytes, Gorilla gorilla,
+#            Pongo pygmaeus, Pongo abelii (or subset as available).
+#   Procedure: (1) Apply MorphoDelim to the complete character dataset.
+#              (2) Degrade the data progressively (introduce missing values
+#                  matching fossil preservation rates) and rerun.
+#              (3) Record the missingness level at which ARI falls below 0.80.
+#
+# PRE-CHECK PHASE 2 — Papio baboons (low FST, expected harder recovery):
+#   Data source: Gilbert et al. (2013) character matrix.
+#   Rationale: Papio species show continuous morphological variation across
+#              genetically defined boundaries, paralleling the ambiguity in
+#              hominin alpha taxonomy.
+#   Procedure: Apply MorphoDelim and assess whether cluster boundaries
+#              correspond to genetically defined species assignments.
+#
+# STATUS: Stub — to be completed once Mongle et al. (2019) and Gilbert et al.
+#   (2013) character matrices are obtained.
+#
+# TO RUN:
+#   1. Load the character matrix into `extant_data` (rows = specimens,
+#      cols = characters, with a `true_species` column).
+#   2. Uncomment and execute the code below.
+# =============================================================================
+
+cat("AIM 3 PRE-CHECK STUB\n")
+cat("Status: Awaiting character matrix data.\n")
+cat("Required: Mongle et al. (2019) — Phase 1; Gilbert et al. (2013) — Phase 2.\n\n")
+
+## ---- PHASE 1: Great Ape Pre-Check ----------------------------------------
+## Uncomment when data are available.
+#
+# extant_data_p1 <- read.csv("[PATH TO MONGLE ET AL. 2019 MATRIX].csv",
+#                             stringsAsFactors = FALSE)
+# # Separate true species labels
+# true_sp_extant <- extant_data_p1$true_species
+# extant_features <- extant_data_p1[, !(names(extant_data_p1) == "true_species")]
+#
+# # Identify continuous and discrete columns from the database
+# # (Character type is recorded in the character database, Table 4)
+# cont_cols_extant <- [VECTOR OF CONTINUOUS CHARACTER COLUMN NAMES]
+# disc_cols_extant <- [VECTOR OF DISCRETE CHARACTER COLUMN NAMES]
+#
+# # Convert discrete cols to factors
+# for (col in disc_cols_extant) {
+#   extant_features[[col]] <- factor(extant_features[[col]])
+# }
+#
+# # Compute Gower distance and run PAM k = number of known species
+# k_extant    <- length(unique(true_sp_extant))
+# gd_extant   <- build_gower_matrix(extant_features)
+# pam_extant  <- pam(gd_extant, k = k_extant, diss = TRUE)
+# ari_extant  <- adjustedRandIndex(pam_extant$clustering, true_sp_extant)
+# cat("Phase 1 ARI (complete data):", round(ari_extant, 4), "\n")
+#
+# # Degradation trials: introduce missingness matching fossil preservation rates
+# for (p_miss in c(0.10, 0.18, 0.30, 0.50, 0.83)) {
+#   deg_data   <- introduce_missing(extant_features,
+#                                   cols   = names(extant_features),
+#                                   p_miss = p_miss, seed = 42)
+#   gd_deg     <- build_gower_matrix(deg_data)
+#   pam_deg    <- pam(gd_deg, k = k_extant, diss = TRUE)
+#   ari_deg    <- adjustedRandIndex(pam_deg$clustering, true_sp_extant)
+#   cat(sprintf("  Missing = %.0f%%  →  ARI = %.4f\n", p_miss * 100, ari_deg))
+# }
+```
+
+```{r aim3-fossil-application-stub}
+# =============================================================================
+# AIM 3 — FOSSIL APPLICATION: AUSTRALOPITHECUS AND PARANTHROPUS
+# =============================================================================
+# DESCRIPTION:
+#   MorphoDelim is applied to published hominin character state encodings
+#   to address Questions 3.1–3.3 of the dissertation:
+#
+#   Q3.1: How many species does MorphoDelim recognise in early Homo sapiens?
+#   Q3.2: How many species does MorphoDelim recover within Paranthropus?
+#         Do current taxonomic assignments hold under quantitative scrutiny?
+#   Q3.3: Where does MLP-3000 statistically fall within Paranthropus morphospace?
+#
+# DATA SOURCES:
+#   Character state encodings: Strait et al. (1997, 2004), Dembo et al. (2015),
+#     and discovery publications as needed.
+#   MLP-3000 measurements: National Museum of Ethiopia specimen, or 3D scans
+#     if direct access is unavailable (Alemseged et al., 2026).
+#
+# PERFORMANCE THRESHOLDS:
+#   Results are interpreted against the simulation benchmarks from Aim 2:
+#   - An ARI ≥ simulation benchmark for the Australopithecus conditions
+#     (Experiment 12) is required to consider species recovery reliable.
+#   - If the application ARI falls below the Experiment 12 benchmark, the
+#     delimitation is inconclusive under the null hypothesis (lumping).
+#
+# STATUS: Stub — to be completed once fossil character data are obtained
+#   and the pre-check validation (above) is confirmed.
+#
+# TO RUN:
+#   1. Load character matrix into `fossil_data`.
+#   2. Replace [PLACEHOLDERS] with column names from the character database.
+#   3. Uncomment and execute the code below.
+# =============================================================================
+
+cat("AIM 3 FOSSIL APPLICATION STUB\n")
+cat("Status: Awaiting fossil character state encodings.\n")
+cat("Required: Strait et al. (1997/2004), Dembo et al. (2015) matrices;\n")
+cat("          MLP-3000 measurements (Alemseged et al., 2026).\n\n")
+
+## ---- Q3.1 and Q3.2: Australopithecus + Paranthropus Application ----------
+## Uncomment when data are available.
+#
+# fossil_data <- read.csv("[PATH TO FOSSIL CHARACTER MATRIX].csv",
+#                          stringsAsFactors = FALSE)
+# true_taxonomy <- fossil_data$taxon_assignment   # published taxonomy label
+# specimen_ids  <- fossil_data$specimen_id
+#
+# fossil_features <- fossil_data[, !(names(fossil_data) %in%
+#                                      c("taxon_assignment", "specimen_id"))]
+# cont_cols_fossil <- [VECTOR OF CONTINUOUS CHARACTER COLUMN NAMES]
+# disc_cols_fossil <- [VECTOR OF DISCRETE CHARACTER COLUMN NAMES]
+#
+# for (col in disc_cols_fossil) {
+#   fossil_features[[col]] <- factor(fossil_features[[col]])
+# }
+#
+# # k-selection: use BIC + silhouette on Gower matrix to determine k
+# gd_fossil <- build_gower_matrix(fossil_features)
+#
+# sil_scores <- sapply(2:8, function(k) {
+#   pam_k <- pam(gd_fossil, k = k, diss = TRUE)
+#   mean(silhouette(pam_k$clustering, gd_fossil)[, "sil_width"])
+# })
+# k_fossil <- which.max(sil_scores) + 1   # +1 because loop starts at k=2
+# cat("Silhouette-selected k:", k_fossil, "\n")
+#
+# # Run MorphoDelim (Simultaneous)
+# pam_fossil <- pam(gd_fossil, k = k_fossil, diss = TRUE)
+# cat("Contingency table vs. published taxonomy:\n")
+# print(table(MorphoDelim = pam_fossil$clustering, Published = true_taxonomy))
+# ari_fossil <- adjustedRandIndex(pam_fossil$clustering, true_taxonomy)
+# cat(sprintf("ARI vs. published taxonomy: %.4f\n", ari_fossil))
+
+## ---- Q3.3: MLP-3000 Placement --------------------------------------------
+## Uncomment when MLP-3000 character data are available.
+#
+# mlp3000 <- read.csv("[PATH TO MLP-3000 CHARACTER ENCODINGS].csv",
+#                      stringsAsFactors = FALSE)
+#
+# # Add MLP-3000 to the existing Paranthropus specimen pool
+# paranthropus_data <- fossil_data[
+#   fossil_data$taxon_assignment %in% c("P. aethiopicus",
+#                                        "P. boisei",
+#                                        "P. robustus"), ]
+#
+# combined_data <- rbind(paranthropus_data,
+#                         cbind(mlp3000, taxon_assignment = "MLP-3000"))
+# combined_features <- combined_data[, !(names(combined_data) %in%
+#                                          c("taxon_assignment", "specimen_id"))]
+# for (col in disc_cols_fossil) {
+#   combined_features[[col]] <- factor(combined_features[[col]])
+# }
+#
+# # Compute Gower distance including MLP-3000 and apply Simultaneous PAM
+# gd_combined  <- build_gower_matrix(combined_features)
+# pam_combined <- pam(gd_combined, k = 3, diss = TRUE)   # k = 3 known species
+#
+# # Identify which cluster MLP-3000 falls in
+# mlp_idx     <- nrow(combined_data)   # MLP-3000 was appended last
+# mlp_cluster <- pam_combined$clustering[mlp_idx]
+#
+# # Map cluster ID to species name by majority vote on the non-MLP specimens
+# non_mlp_labels  <- combined_data$taxon_assignment[-mlp_idx]
+# non_mlp_clusters <- pam_combined$clustering[-mlp_idx]
+# cluster_to_sp   <- align_labels(non_mlp_clusters, non_mlp_labels)
+# mlp_assignment  <- cluster_to_sp[mlp_idx]   # majority-vote species for MLP-3000
+#
+# cat("MLP-3000 cluster assignment:", mlp_cluster, "\n")
+# cat("MLP-3000 maps to species:   ", mlp_assignment, "\n")
+#
+# # Silhouette width for MLP-3000 specimen — how well does it fit its cluster?
+# sil_combined <- silhouette(pam_combined$clustering, gd_combined)
+# mlp_sil      <- sil_combined[mlp_idx, "sil_width"]
+# cat(sprintf("MLP-3000 silhouette width: %.4f\n", mlp_sil))
+# cat("  (sil > 0: fits cluster; sil < 0: may belong elsewhere)\n")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+# -----------------------------------------------------------------------------
+# SESSION INFORMATION
+# -----------------------------------------------------------------------------
+# Printed for full reproducibility: exact R version, package versions, and
+# operating system. A reviewer replicating this analysis should use the same
+# package versions. If results differ, version mismatches are the first
+# place to check.
+# -----------------------------------------------------------------------------
+cat("=== SESSION INFORMATION ===\n")
+sessionInfo()
+```
