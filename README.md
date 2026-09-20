@@ -12,13 +12,8 @@ Institution: The University of Texas at Austin
 
 ## Repository structure
 ├── Known_Hominin_Characters copy.csv
-<<<<<<< HEAD
-├── README.md
-├──MorphoDelim_Dissertation.md copy
-=======
 
 ├── README.md
->>>>>>> 3195635403f50456a4707f0591bdb283f6d00977
 
 ## Dependencies
 R packages: 
