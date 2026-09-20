@@ -7,12 +7,18 @@ under controlled, evaluated with the Adjusted Rand Index (ARI). It is Chapter 2 
 
 ## Project context
 Project: Chapter 2 MorphoDelim
+
 Institution: The University of Texas at Austin
 
 ## Repository structure
 ├── Known_Hominin_Characters copy.csv
+<<<<<<< HEAD
 ├── README.md
 ├──MorphoDelim_Dissertation.md copy
+=======
+
+├── README.md
+>>>>>>> 3195635403f50456a4707f0591bdb283f6d00977
 
 ## Dependencies
 R packages: 
@@ -24,7 +30,8 @@ R packages:
 Not really sure what to put here. 
 
 ## Data
-The data was compiled from published hominin character matrices. 
+The data was compiled from published hominin character matrices from Strait et al. 1997; 2004, Dembo et al. 2015, and Mongle et al. 2019
+
 
 ## Author
 Name: Jyhreh Johnson 
