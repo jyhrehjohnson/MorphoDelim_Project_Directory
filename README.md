@@ -1,20 +1,16 @@
-# MorphoDelim: Simulation-Based Species Delimitation
+# MorphoDelim: Simulation Based Species Delimitation among Plio-Pleistocene Hominins
 
 ## Description
-MorphoDelim is an R-based simulation framework that tests how well
+MorphoDelim is a simulation based framework that tests how well
 morphological clustering (Gower's distance + PAM) recovers known species boundaries
-under controlled levels of genetic differentiation (FST), evaluated with the Adjusted
-Rand Index (ARI). It is Chapter 2 of a dissertation on taxonomy and species delimitation
-among Plio-Pleistocene hominins.
+under controlled, evaluated with the Adjusted Rand Index (ARI). It is Chapter 2 of a dissertation on taxonomy and species delimitation.
 
 ## Project context
-- Project: Chapter 2 MorphoDelim
-- Institution: The University of Texas at Austin
+Project: Chapter 2 MorphoDelim
+Institution: The University of Texas at Austin
 
 ## Repository structure
-```
-[folder]/    # [one line each]
-```
+
 
 ## Dependencies
 - R [VERSION] and [OS]
