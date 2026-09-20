@@ -11,6 +11,7 @@ Institution: The University of Texas at Austin
 
 ## Repository structure
 ├── Known_Hominin_Characters copy.csv
+
 ├── README.md
 
 ## Dependencies
