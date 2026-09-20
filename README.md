@@ -10,8 +10,8 @@ Project: Chapter 2 MorphoDelim
 Institution: The University of Texas at Austin
 
 ## Repository structure
-Known_Hominin_Characters copy.csv
-README.md
+├── Known_Hominin_Characters copy.csv
+├── README.md
 
 ## Dependencies
 R packages: 
